@@ -9,60 +9,44 @@
 //# publish
 
 module test::m {
-    use sui::tx_context::{Self, TxContext};
+    use sui::dynamic_object_field as ofield;
 
-    struct S has key, store {
+    public struct S has key, store {
         id: sui::object::UID,
     }
 
-    public entry fun mint(ctx: &mut TxContext) {
-        let s = S { id: sui::object::new(ctx) };
-        sui::transfer::transfer(s, tx_context::sender(ctx))
+    public struct R has key, store {
+        id: sui::object::UID,
+        s: S,
     }
 
-    public entry fun share(s: S) {
-        sui::transfer::share_object(s)
+    public entry fun mint(ctx: &mut TxContext) {
+        let mut id = sui::object::new(ctx);
+        let child = S { id: sui::object::new(ctx) };
+        ofield::add(&mut id, 0, child);
+        sui::transfer::public_transfer(S { id }, tx_context::sender(ctx))
+    }
+
+    public entry fun mint_and_share(ctx: &mut TxContext) {
+        let mut id = sui::object::new(ctx);
+        let child = S { id: sui::object::new(ctx) };
+        ofield::add(&mut id, 0, child);
+        sui::transfer::public_share_object(S { id })
     }
 
     public entry fun transfer(s: S, recipient: address) {
-        sui::transfer::transfer(s, recipient)
-    }
-
-    public entry fun transfer_to_object(child: S, parent: &mut S) {
-        sui::transfer::transfer_to_object(child, parent)
+        sui::transfer::public_transfer(s, recipient)
     }
 
 }
 
 //
-// Test transfer_to_object allows non-zero child count
-//
-
-//# run test::m::mint --sender A
-
-//# run test::m::mint --sender A
-
-//# run test::m::mint --sender A
-
-//# run test::m::transfer_to_object --sender A --args object(111) object(109)
-
-//# view-object 109
-
-//# run test::m::transfer_to_object --sender A --args object(109) object(107)
-
-//
 // Test share object allows non-zero child count
 //
 
-//# run test::m::mint --sender A
+//# run test::m::mint_and_share --sender A
 
-//# run test::m::mint --sender A
-
-//# run test::m::transfer_to_object --sender A --args object(117) object(115)
-
-//# view-object 115
-
-//# run test::m::share --sender A --args object(115)
+//# view-object 2,1
 
 //
 // Test transfer allows non-zero child count
@@ -70,13 +54,9 @@ module test::m {
 
 //# run test::m::mint --sender A
 
-//# run test::m::mint --sender A
+//# run test::m::transfer --sender A --args object(4,2) @B
 
-//# run test::m::transfer_to_object --sender A --args object(123) object(121)
-
-//# view-object 121
-
-//# run test::m::transfer --sender A --args object(121) @B
+//# view-object 4,2
 
 //
 // Test TransferObject allows non-zero child count
@@ -84,10 +64,6 @@ module test::m {
 
 //# run test::m::mint --sender A
 
-//# run test::m::mint --sender A
+//# transfer-object 7,1 --sender A --recipient B
 
-//# run test::m::transfer_to_object --sender A --args object(129) object(127)
-
-//# view-object 127
-
-//# transfer-object 127 --sender A --recipient B
+//# view-object 7,1

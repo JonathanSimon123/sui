@@ -1,3 +1,7 @@
 packages:
-  - "sdk/**"
-  - "apps/**"
+  - 'apps/**'
+  - 'dapps/**'
+  - 'examples/**'
+  - 'external-crates/move/tooling/prettier-move'
+  - '!**/dist/**'
+  - '!**/.next/**'

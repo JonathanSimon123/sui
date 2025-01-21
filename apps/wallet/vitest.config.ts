@@ -1,24 +1,16 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import { defineConfig } from 'vitest/config';
+import tsconfigPaths from 'vite-tsconfig-paths';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 export default defineConfig({
-    test: {
-        minThreads: 1,
-        setupFiles: ['./test_setup.ts'],
-    },
-    resolve: {
-        alias: {
-            '@mysten/sui.js': new URL(
-                '../../sdk/typescript/src',
-                import.meta.url
-            ).toString(),
-
-            '@mysten/bcs': new URL(
-                '../../sdk/bcs/src',
-                import.meta.url
-            ).toString(),
-        },
-    },
+	plugins: [tsconfigPaths()],
+	test: {
+		exclude: [...configDefaults.exclude, 'tests/**'],
+		// TODO: Create custom extension environment.
+		environment: 'happy-dom',
+		setupFiles: ['./testSetup.ts'],
+		restoreMocks: true,
+	},
 });

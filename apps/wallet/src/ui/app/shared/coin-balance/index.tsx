@@ -1,40 +1,27 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import cl from 'classnames';
-import { memo } from 'react';
-import { useIntl } from 'react-intl';
+import { Text } from '_app/shared/text';
+import { useFormatCoin } from '@mysten/core';
+import { SUI_TYPE_ARG } from '@mysten/sui/utils';
 
-import { balanceFormatOptions } from '_shared/formatting';
-
-import st from './CoinBalance.module.scss';
-
-export type CoinBalanceProps = {
-    className?: string;
-    balance: bigint;
-    symbol: string;
-    mode?: 'neutral' | 'positive' | 'negative';
-    diffSymbol?: boolean;
-    title?: string;
-};
-
-function CoinBalance({
-    balance,
-    symbol,
-    className,
-    mode = 'neutral',
-    diffSymbol = false,
-    title,
-}: CoinBalanceProps) {
-    const intl = useIntl();
-    return (
-        <div className={cl(className, st.container, st[mode])} title={title}>
-            <span>{intl.formatNumber(balance, balanceFormatOptions)}</span>
-            <span className={cl(st.symbol, { [st.diffSymbol]: diffSymbol })}>
-                {symbol}
-            </span>
-        </div>
-    );
+//TODO create variant for different use cases like heading4, subtitle, bodySmall and different symbols color
+interface CoinBalanceProps {
+	amount: bigint | number | string;
+	coinType?: string;
 }
 
-export default memo(CoinBalance);
+export function CoinBalance({ amount, coinType }: CoinBalanceProps) {
+	const [formatted, symbol] = useFormatCoin(amount, coinType || SUI_TYPE_ARG);
+
+	return Math.abs(Number(amount)) > 0 ? (
+		<div className="flex gap-0.5 align-baseline flex-nowrap items-baseline">
+			<Text variant="body" weight="semibold" color="gray-90">
+				{formatted}
+			</Text>
+			<Text variant="subtitle" color="gray-90" weight="medium">
+				{symbol}
+			</Text>
+		</div>
+	) : null;
+}
