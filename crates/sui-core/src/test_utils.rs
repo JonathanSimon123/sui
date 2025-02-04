@@ -1,112 +1,316 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::authority::AuthorityState;
-use signature::Signer;
-use std::collections::HashSet;
+use fastcrypto::hash::MultisetHash;
+use fastcrypto::traits::KeyPair;
+use move_core_types::{account_address::AccountAddress, ident_str};
+use shared_crypto::intent::{Intent, IntentScope};
 use std::sync::Arc;
 use std::time::Duration;
-
-use sui_types::{
-    base_types::{dbg_addr, ObjectID, TransactionDigest},
-    batch::UpdateItem,
-    crypto::{get_key_pair, AccountKeyPair, Signature},
-    messages::{BatchInfoRequest, BatchInfoResponseItem, Transaction, TransactionData},
-    object::Object,
+use sui_config::genesis::Genesis;
+use sui_macros::nondeterministic;
+use sui_types::base_types::{random_object_ref, ObjectID};
+use sui_types::crypto::AuthorityKeyPair;
+use sui_types::crypto::{AccountKeyPair, AuthorityPublicKeyBytes, Signer};
+use sui_types::effects::{SignedTransactionEffects, TestEffectsBuilder};
+use sui_types::error::SuiError;
+use sui_types::signature_verification::VerifiedDigestCache;
+use sui_types::transaction::ObjectArg;
+use sui_types::transaction::{
+    CallArg, SignedTransaction, Transaction, TransactionData, TEST_ONLY_GAS_UNIT_FOR_TRANSFER,
 };
+use sui_types::utils::create_fake_transaction;
+use sui_types::utils::to_sender_signed_transaction;
+use sui_types::{
+    base_types::{AuthorityName, ExecutionDigests, ObjectRef, SuiAddress, TransactionDigest},
+    committee::Committee,
+    crypto::{AuthoritySignInfo, AuthoritySignature},
+    message_envelope::Message,
+    transaction::CertifiedTransaction,
+};
+use tokio::time::timeout;
+use tracing::{info, warn};
 
-use futures::StreamExt;
-use tokio::time::sleep;
-use tracing::info;
+use crate::authority::AuthorityState;
+use crate::state_accumulator::StateAccumulator;
 
-pub async fn wait_for_tx(wait_digest: TransactionDigest, state: Arc<AuthorityState>) {
-    wait_for_all_txes(vec![wait_digest], state).await
+const WAIT_FOR_TX_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub async fn send_and_confirm_transaction(
+    authority: &AuthorityState,
+    fullnode: Option<&AuthorityState>,
+    transaction: Transaction,
+) -> Result<(CertifiedTransaction, SignedTransactionEffects), SuiError> {
+    // Make the initial request
+    let epoch_store = authority.load_epoch_store_one_call_per_task();
+    transaction.validity_check(epoch_store.protocol_config(), epoch_store.epoch())?;
+    let transaction = epoch_store.verify_transaction(transaction)?;
+    let response = authority
+        .handle_transaction(&epoch_store, transaction.clone())
+        .await?;
+    let vote = response.status.into_signed_for_testing();
+
+    // Collect signatures from a quorum of authorities
+    let committee = authority.clone_committee_for_testing();
+    let certificate =
+        CertifiedTransaction::new(transaction.into_message(), vec![vote.clone()], &committee)
+            .unwrap()
+            .try_into_verified_for_testing(&committee, &Default::default())
+            .unwrap();
+
+    // Submit the confirmation. *Now* execution actually happens, and it should fail when we try to look up our dummy module.
+    // we unfortunately don't get a very descriptive error message, but we can at least see that something went wrong inside the VM
+    //
+    // We also check the incremental effects of the transaction on the live object set against StateAccumulator
+    // for testing and regression detection
+    let state_acc = StateAccumulator::new_for_tests(authority.get_accumulator_store().clone());
+    let include_wrapped_tombstone = !authority
+        .epoch_store_for_testing()
+        .protocol_config()
+        .simplified_unwrap_then_delete();
+    let mut state =
+        state_acc.accumulate_cached_live_object_set_for_testing(include_wrapped_tombstone);
+    let (result, _execution_error_opt) = authority.try_execute_for_test(&certificate).await?;
+    let state_after =
+        state_acc.accumulate_cached_live_object_set_for_testing(include_wrapped_tombstone);
+    let effects_acc = state_acc.accumulate_effects(
+        vec![result.inner().data().clone()],
+        epoch_store.protocol_config(),
+    );
+    state.union(&effects_acc);
+
+    assert_eq!(state_after.digest(), state.digest());
+
+    if let Some(fullnode) = fullnode {
+        fullnode.try_execute_for_test(&certificate).await?;
+    }
+    Ok((certificate.into_inner(), result.into_inner()))
 }
 
-pub async fn wait_for_all_txes(wait_digests: Vec<TransactionDigest>, state: Arc<AuthorityState>) {
-    let mut wait_digests: HashSet<_> = wait_digests.iter().collect();
+// note: clippy is confused about this being dead - it appears to only be used in cfg(test), but
+// adding #[cfg(test)] causes other targets to fail
+#[allow(dead_code)]
+pub(crate) fn init_state_parameters_from_rng<R>(rng: &mut R) -> (Genesis, AuthorityKeyPair)
+where
+    R: rand::CryptoRng + rand::RngCore,
+{
+    let dir = nondeterministic!(tempfile::TempDir::new().unwrap());
+    let network_config = sui_swarm_config::network_config_builder::ConfigBuilder::new(&dir)
+        .rng(rng)
+        .build();
+    let genesis = network_config.genesis;
+    let authority_key = network_config.validator_configs[0]
+        .protocol_key_pair()
+        .copy();
 
-    let mut timeout = Box::pin(sleep(Duration::from_millis(15_000)));
+    (genesis, authority_key)
+}
 
-    let mut max_seq = Some(0);
-
-    let mut stream = Box::pin(
+pub async fn wait_for_tx(digest: TransactionDigest, state: Arc<AuthorityState>) {
+    match timeout(
+        WAIT_FOR_TX_TIMEOUT,
         state
-            .handle_batch_streaming(BatchInfoRequest {
-                start: max_seq,
-                length: 1000,
-            })
-            .await
-            .unwrap(),
-    );
-
-    // TODO: duplicated code with transaction.rs
-    loop {
-        tokio::select! {
-            _ = &mut timeout => panic!("wait_for_tx timed out"),
-
-            items = &mut stream.next() => {
-                match items {
-                    // Upon receiving a batch
-                    Some(Ok(BatchInfoResponseItem(UpdateItem::Batch(batch)) )) => {
-                        max_seq = Some(batch.data().next_sequence_number);
-                        info!(?max_seq, "Received Batch");
-                    }
-                    // Upon receiving a transaction digest we store it, if it is not processed already.
-                    Some(Ok(BatchInfoResponseItem(UpdateItem::Transaction((_seq, digest))))) => {
-                        info!(?digest, "Received Transaction");
-                        if wait_digests.remove(&digest.transaction) {
-                            info!(?digest, "Digest found");
-                        }
-                        if wait_digests.is_empty() {
-                            info!(?digest, "all digests found");
-                            break;
-                        }
-                    },
-
-                    Some(Err( err )) => panic!("{}", err),
-                    None => {
-                        info!(?max_seq, "Restarting Batch");
-                        stream = Box::pin(
-                                state
-                                    .handle_batch_streaming(BatchInfoRequest {
-                                        start: max_seq,
-                                        length: 1000,
-                                    })
-                                    .await
-                                    .unwrap(),
-                            );
-
-                    }
-                }
-            },
+            .get_transaction_cache_reader()
+            .notify_read_executed_effects(&[digest]),
+    )
+    .await
+    {
+        Ok(_) => info!(?digest, "digest found"),
+        Err(e) => {
+            warn!(?digest, "digest not found!");
+            panic!("timed out waiting for effects of digest! {e}");
         }
     }
 }
 
-// Creates a fake sender-signed transaction for testing. This transaction will
-// not actually work.
-pub fn create_fake_transaction() -> Transaction {
-    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
-    let recipient = dbg_addr(2);
-    let object_id = ObjectID::random();
-    let object = Object::immutable_with_id_for_testing(object_id);
+pub async fn wait_for_all_txes(digests: Vec<TransactionDigest>, state: Arc<AuthorityState>) {
+    match timeout(
+        WAIT_FOR_TX_TIMEOUT,
+        state
+            .get_transaction_cache_reader()
+            .notify_read_executed_effects(&digests),
+    )
+    .await
+    {
+        Ok(_) => info!(?digests, "all digests found"),
+        Err(e) => {
+            warn!(?digests, "some digests not found!");
+            panic!("timed out waiting for effects of digests! {e}");
+        }
+    }
+}
+
+pub fn create_fake_cert_and_effect_digest<'a>(
+    signers: impl Iterator<
+        Item = (
+            &'a AuthorityName,
+            &'a (dyn Signer<AuthoritySignature> + Send + Sync),
+        ),
+    >,
+    committee: &Committee,
+) -> (ExecutionDigests, CertifiedTransaction) {
+    let transaction = create_fake_transaction();
+    let cert = CertifiedTransaction::new(
+        transaction.data().clone(),
+        signers
+            .map(|(name, signer)| {
+                AuthoritySignInfo::new(
+                    committee.epoch,
+                    transaction.data(),
+                    Intent::sui_app(IntentScope::SenderSignedTransaction),
+                    *name,
+                    signer,
+                )
+            })
+            .collect(),
+        committee,
+    )
+    .unwrap();
+    let effects = TestEffectsBuilder::new(transaction.data()).build();
+    (
+        ExecutionDigests::new(*transaction.digest(), effects.digest()),
+        cert,
+    )
+}
+
+pub fn make_transfer_sui_transaction(
+    gas_object: ObjectRef,
+    recipient: SuiAddress,
+    amount: Option<u64>,
+    sender: SuiAddress,
+    keypair: &AccountKeyPair,
+    gas_price: u64,
+) -> Transaction {
     let data = TransactionData::new_transfer_sui(
         recipient,
         sender,
-        None,
-        object.compute_object_reference(),
-        10000,
+        amount,
+        gas_object,
+        gas_price * TEST_ONLY_GAS_UNIT_FOR_TRANSFER,
+        gas_price,
     );
-    to_sender_signed_transaction(data, &sender_key)
+    to_sender_signed_transaction(data, keypair)
 }
 
-// This is used to sign transaction with signer using default Intent.
-pub fn to_sender_signed_transaction(
-    data: TransactionData,
-    signer: &dyn Signer<Signature>,
+pub fn make_pay_sui_transaction(
+    gas_object: ObjectRef,
+    coins: Vec<ObjectRef>,
+    recipients: Vec<SuiAddress>,
+    amounts: Vec<u64>,
+    sender: SuiAddress,
+    keypair: &AccountKeyPair,
+    gas_price: u64,
+    gas_budget: u64,
 ) -> Transaction {
-    let signature = Signature::new_temp(&data.to_bytes(), signer);
-    // let signature = Signature::new_secure(&data, Intent::default(), signer).unwrap();
-    Transaction::new(data, signature)
+    let data = TransactionData::new_pay_sui(
+        sender, coins, recipients, amounts, gas_object, gas_budget, gas_price,
+    )
+    .unwrap();
+    to_sender_signed_transaction(data, keypair)
+}
+
+pub fn make_transfer_object_transaction(
+    object_ref: ObjectRef,
+    gas_object: ObjectRef,
+    sender: SuiAddress,
+    keypair: &AccountKeyPair,
+    recipient: SuiAddress,
+    gas_price: u64,
+) -> Transaction {
+    let data = TransactionData::new_transfer(
+        recipient,
+        object_ref,
+        sender,
+        gas_object,
+        gas_price * TEST_ONLY_GAS_UNIT_FOR_TRANSFER * 10,
+        gas_price,
+    );
+    to_sender_signed_transaction(data, keypair)
+}
+
+pub fn make_transfer_object_move_transaction(
+    src: SuiAddress,
+    keypair: &AccountKeyPair,
+    dest: SuiAddress,
+    object_ref: ObjectRef,
+    framework_obj_id: ObjectID,
+    gas_object_ref: ObjectRef,
+    gas_budget_in_units: u64,
+    gas_price: u64,
+) -> Transaction {
+    let args = vec![
+        CallArg::Object(ObjectArg::ImmOrOwnedObject(object_ref)),
+        CallArg::Pure(bcs::to_bytes(&AccountAddress::from(dest)).unwrap()),
+    ];
+
+    to_sender_signed_transaction(
+        TransactionData::new_move_call(
+            src,
+            framework_obj_id,
+            ident_str!("object_basics").to_owned(),
+            ident_str!("transfer").to_owned(),
+            Vec::new(),
+            gas_object_ref,
+            args,
+            gas_budget_in_units * gas_price,
+            gas_price,
+        )
+        .unwrap(),
+        keypair,
+    )
+}
+
+/// Make a dummy tx that uses random object refs.
+pub fn make_dummy_tx(
+    receiver: SuiAddress,
+    sender: SuiAddress,
+    sender_sec: &AccountKeyPair,
+) -> Transaction {
+    Transaction::from_data_and_signer(
+        TransactionData::new_transfer(
+            receiver,
+            random_object_ref(),
+            sender,
+            random_object_ref(),
+            TEST_ONLY_GAS_UNIT_FOR_TRANSFER * 10,
+            10,
+        ),
+        vec![sender_sec],
+    )
+}
+
+/// Make a cert using an arbitrarily large committee.
+pub fn make_cert_with_large_committee(
+    committee: &Committee,
+    key_pairs: &[AuthorityKeyPair],
+    transaction: &Transaction,
+) -> CertifiedTransaction {
+    // assumes equal weighting.
+    let len = committee.voting_rights.len();
+    assert_eq!(len, key_pairs.len());
+    let count = (len * 2 + 2) / 3;
+
+    let sigs: Vec<_> = key_pairs
+        .iter()
+        .take(count)
+        .map(|key_pair| {
+            SignedTransaction::new(
+                committee.epoch(),
+                transaction.clone().into_data(),
+                key_pair,
+                AuthorityPublicKeyBytes::from(key_pair.public()),
+            )
+            .auth_sig()
+            .clone()
+        })
+        .collect();
+
+    let cert = CertifiedTransaction::new(transaction.clone().into_data(), sigs, committee).unwrap();
+    cert.verify_signatures_authenticated(
+        committee,
+        &Default::default(),
+        Arc::new(VerifiedDigestCache::new_empty()),
+    )
+    .unwrap();
+    cert
 }

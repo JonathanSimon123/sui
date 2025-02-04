@@ -1,259 +1,118 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::system_state_observer::SystemStateObserver;
+use crate::workloads::payload::Payload;
+use crate::workloads::{Gas, GasCoinConfig};
+use crate::ValidatorProxy;
+use anyhow::anyhow;
 use async_trait::async_trait;
+use rand::distributions::{Distribution, Standard};
+use rand::Rng;
+use std::str::FromStr;
 use std::sync::Arc;
-use std::{collections::HashMap, fmt};
-use sui_core::quorum_driver::{QuorumDriverHandler, QuorumDriverMetrics};
-use sui_core::{
-    authority_aggregator::AuthorityAggregator, authority_client::NetworkAuthorityClient,
-};
-use sui_types::{
-    base_types::{ObjectID, ObjectRef},
-    crypto::EmptySignInfo,
-    messages::{TransactionEffects, TransactionEnvelope},
-    object::{Object, ObjectRead, Owner},
-};
-
-use futures::FutureExt;
-use sui_types::{
-    base_types::SuiAddress,
-    crypto::AccountKeyPair,
-    messages::{QuorumDriverRequest, QuorumDriverRequestType, QuorumDriverResponse, Transaction},
-};
-use test_utils::messages::make_transfer_sui_transaction;
-use tracing::error;
-
-use rand::{prelude::*, rngs::OsRng};
-use rand_distr::WeightedAliasIndex;
+use strum::{EnumCount, IntoEnumIterator};
+use strum_macros::{EnumCount as EnumCountMacro, EnumIter};
+use sui_types::gas_coin::MIST_PER_SUI;
 
 // This is the maximum gas we will transfer from primary coin into any gas coin
 // for running the benchmark
-pub const MAX_GAS_FOR_TESTING: u64 = 1_000_000_000;
+pub const MAX_GAS_FOR_TESTING: u64 = 1_000 * MIST_PER_SUI;
 
-pub type Gas = (ObjectRef, Owner);
+// TODO: get this information from protocol config
+// This is the maximum budget that can be set for a transaction. 50 SUI.
+pub const MAX_BUDGET: u64 = 50 * MIST_PER_SUI;
+// (COIN_BYTES_SIZE * STORAGE_PRICE * STORAGE_UNITS_PER_BYTE)
+pub const STORAGE_COST_PER_COIN: u64 = 130 * 76 * 100;
+// (COUNTER_BYTES_SIZE * STORAGE_PRICE * STORAGE_UNITS_PER_BYTE)
+pub const STORAGE_COST_PER_COUNTER: u64 = 341 * 76 * 100;
+/// Used to estimate the budget required for each transaction.
+pub const ESTIMATED_COMPUTATION_COST: u64 = 1_000_000;
 
-pub type UpdatedAndNewlyMinted = (ObjectRef, ObjectRef);
+#[derive(Debug, EnumCountMacro, EnumIter, Clone, Copy, PartialEq)]
+pub enum ExpectedFailureType {
+    Random = 0,
+    InvalidSignature,
+    // TODO: Add other failure types
 
-pub async fn transfer_sui_for_testing(
-    gas: Gas,
-    keypair: &AccountKeyPair,
-    value: u64,
-    address: SuiAddress,
-    aggregator: Arc<AuthorityAggregator<NetworkAuthorityClient>>,
-) -> Option<UpdatedAndNewlyMinted> {
-    let tx = make_transfer_sui_transaction(
-        gas.0,
-        address,
-        Some(value),
-        gas.1.get_owner_address().unwrap(),
-        keypair,
+    // This is not a failure type, but a placeholder for no failure. Marking no failure asserts that
+    // the transaction must succeed.
+    NoFailure,
+}
+
+impl TryFrom<u32> for ExpectedFailureType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => {
+                let mut rng = rand::thread_rng();
+                let n = rng.gen_range(1..ExpectedFailureType::COUNT - 1);
+                Ok(ExpectedFailureType::iter().nth(n).unwrap())
+            }
+            _ => ExpectedFailureType::iter()
+                .nth(value as usize)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Invalid failure type specifier. Valid options are {} to {}",
+                        0,
+                        ExpectedFailureType::COUNT
+                    )
+                }),
+        }
+    }
+}
+
+impl FromStr for ExpectedFailureType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let v = u32::from_str(s).map(ExpectedFailureType::try_from);
+
+        if let Ok(Ok(q)) = v {
+            return Ok(q);
+        }
+
+        Err(anyhow!(
+            "Invalid input string. Valid values are 0 to {}",
+            ExpectedFailureType::COUNT
+        ))
+    }
+}
+
+impl Distribution<ExpectedFailureType> for Standard {
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> ExpectedFailureType {
+        // Exclude the "Random" variant
+        let n = rng.gen_range(1..ExpectedFailureType::COUNT);
+        ExpectedFailureType::iter().nth(n).unwrap()
+    }
+}
+
+#[async_trait]
+pub trait WorkloadBuilder<T: Payload + ?Sized>: Send + Sync + std::fmt::Debug {
+    async fn generate_coin_config_for_init(&self) -> Vec<GasCoinConfig>;
+    async fn generate_coin_config_for_payloads(&self) -> Vec<GasCoinConfig>;
+    async fn build(&self, init_gas: Vec<Gas>, payload_gas: Vec<Gas>) -> Box<dyn Workload<T>>;
+}
+
+/// A Workload is used to generate multiple payloads during setup phase with `make_test_payloads()`
+/// which are added to a local queue. We execute transactions (the queue is drained based on the
+/// target qps i.e. for 100 tps, the queue will be popped 100 times every second) with those payloads
+/// and generate new payloads (which are enqueued back to the queue) with the returned effects. The
+/// total number of payloads to generate depends on how much transaction throughput we want and the
+/// maximum number of transactions we want to have in flight. For instance, for a 100 target_qps and
+/// in_flight_ratio of 5, a maximum of 500 transactions is expected to be in flight and that many
+/// payloads are created.
+#[async_trait]
+pub trait Workload<T: Payload + ?Sized>: Send + Sync + std::fmt::Debug {
+    async fn init(
+        &mut self,
+        proxy: Arc<dyn ValidatorProxy + Sync + Send>,
+        system_state_observer: Arc<SystemStateObserver>,
     );
-    let quorum_driver_handler =
-        QuorumDriverHandler::new(aggregator.clone(), QuorumDriverMetrics::new_for_tests());
-    let qd = quorum_driver_handler.clone_quorum_driver();
-    qd.execute_transaction(QuorumDriverRequest {
-        transaction: tx.clone(),
-        request_type: QuorumDriverRequestType::WaitForEffectsCert,
-    })
-    .map(move |res| match res {
-        Ok(QuorumDriverResponse::EffectsCert(result)) => {
-            let (_, effects) = *result;
-            let minted = effects.effects.created.get(0).unwrap().0;
-            let updated = effects
-                .effects
-                .mutated
-                .iter()
-                .find(|(k, _)| k.0 == gas.0 .0)
-                .unwrap()
-                .0;
-            Some((updated, minted))
-        }
-        Ok(resp) => {
-            error!("Unexpected response while transferring sui: {:?}", resp);
-            None
-        }
-        Err(err) => {
-            error!("Error while transferring sui: {:?}", err);
-            None
-        }
-    })
-    .await
-}
-
-pub async fn get_latest(
-    object_id: ObjectID,
-    aggregator: &Arc<AuthorityAggregator<NetworkAuthorityClient>>,
-) -> Option<Object> {
-    // Return the latest object version
-    match aggregator.get_object_info_execute(object_id).await.unwrap() {
-        ObjectRead::Exists(_, object, _) => Some(object),
-        _ => None,
-    }
-}
-
-pub async fn submit_transaction(
-    transaction: Transaction,
-    aggregator: Arc<AuthorityAggregator<NetworkAuthorityClient>>,
-) -> Option<TransactionEffects> {
-    let qd = QuorumDriverHandler::new(aggregator.clone(), QuorumDriverMetrics::new_for_tests());
-    if let QuorumDriverResponse::EffectsCert(result) = qd
-        .clone_quorum_driver()
-        .execute_transaction(QuorumDriverRequest {
-            transaction,
-            request_type: QuorumDriverRequestType::WaitForEffectsCert,
-        })
-        .await
-        .unwrap()
-    {
-        let (_, effects) = *result;
-        Some(effects.effects)
-    } else {
-        None
-    }
-}
-
-pub trait Payload: Send + Sync {
-    fn make_new_payload(
-        self: Box<Self>,
-        new_object: ObjectRef,
-        new_gas: ObjectRef,
-    ) -> Box<dyn Payload>;
-    fn make_transaction(&self) -> TransactionEnvelope<EmptySignInfo>;
-    fn get_object_id(&self) -> ObjectID;
-    fn get_workload_type(&self) -> WorkloadType;
-}
-
-pub struct CombinationPayload {
-    payloads: Vec<Box<dyn Payload>>,
-    dist: WeightedAliasIndex<u32>,
-    curr_index: usize,
-    rng: OsRng,
-}
-
-impl Payload for CombinationPayload {
-    fn make_new_payload(
-        self: Box<Self>,
-        new_object: ObjectRef,
-        new_gas: ObjectRef,
-    ) -> Box<dyn Payload> {
-        let mut new_payloads = vec![];
-        for (pos, e) in self.payloads.into_iter().enumerate() {
-            if pos == self.curr_index {
-                let updated = e.make_new_payload(new_object, new_gas);
-                new_payloads.push(updated);
-            } else {
-                new_payloads.push(e);
-            }
-        }
-        let mut rng = self.rng;
-        let next_index = self.dist.sample(&mut rng);
-        Box::new(CombinationPayload {
-            payloads: new_payloads,
-            dist: self.dist,
-            curr_index: next_index,
-            rng: self.rng,
-        })
-    }
-    fn make_transaction(&self) -> TransactionEnvelope<EmptySignInfo> {
-        let curr = self.payloads.get(self.curr_index).unwrap();
-        curr.make_transaction()
-    }
-    fn get_object_id(&self) -> ObjectID {
-        let curr = self.payloads.get(self.curr_index).unwrap();
-        curr.get_object_id()
-    }
-    fn get_workload_type(&self) -> WorkloadType {
-        self.payloads
-            .get(self.curr_index)
-            .unwrap()
-            .get_workload_type()
-    }
-}
-
-#[derive(Copy, Clone, Hash, PartialEq, Eq)]
-pub enum WorkloadType {
-    SharedCounter,
-    TransferObject,
-}
-
-impl fmt::Display for WorkloadType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            WorkloadType::SharedCounter => write!(f, "shared_counter"),
-            WorkloadType::TransferObject => write!(f, "transfer_object"),
-        }
-    }
-}
-
-#[async_trait]
-pub trait Workload<T: Payload + ?Sized>: Send + Sync {
-    async fn init(&mut self, aggregator: Arc<AuthorityAggregator<NetworkAuthorityClient>>);
     async fn make_test_payloads(
         &self,
-        count: u64,
-        client: Arc<AuthorityAggregator<NetworkAuthorityClient>>,
+        proxy: Arc<dyn ValidatorProxy + Sync + Send>,
+        system_state_observer: Arc<SystemStateObserver>,
     ) -> Vec<Box<T>>;
-}
-
-type WeightAndPayload = (u32, Box<dyn Workload<dyn Payload>>);
-pub struct CombinationWorkload {
-    workloads: HashMap<WorkloadType, WeightAndPayload>,
-}
-
-#[async_trait]
-impl Workload<dyn Payload> for CombinationWorkload {
-    async fn init(&mut self, aggregator: Arc<AuthorityAggregator<NetworkAuthorityClient>>) {
-        for (_, (_, workload)) in self.workloads.iter_mut() {
-            workload.init(aggregator.clone()).await;
-        }
-    }
-    async fn make_test_payloads(
-        &self,
-        count: u64,
-        aggregator: Arc<AuthorityAggregator<NetworkAuthorityClient>>,
-    ) -> Vec<Box<dyn Payload>> {
-        let mut workloads: HashMap<WorkloadType, (u32, Vec<Box<dyn Payload>>)> = HashMap::new();
-        for (workload_type, (weight, workload)) in self.workloads.iter() {
-            let payloads: Vec<Box<dyn Payload>> =
-                workload.make_test_payloads(count, aggregator.clone()).await;
-            assert_eq!(payloads.len() as u64, count);
-            workloads
-                .entry(*workload_type)
-                .or_insert_with(|| (*weight, payloads));
-        }
-        let mut res = vec![];
-        for _i in 0..count {
-            let mut all_payloads: Vec<Box<dyn Payload>> = vec![];
-            let mut dist = vec![];
-            for (_type, (weight, payloads)) in workloads.iter_mut() {
-                all_payloads.push(payloads.pop().unwrap());
-                dist.push(*weight);
-            }
-            res.push(Box::new(CombinationPayload {
-                payloads: all_payloads,
-                dist: WeightedAliasIndex::new(dist).unwrap(),
-                curr_index: 0,
-                rng: OsRng::default(),
-            }));
-        }
-        res.into_iter()
-            .map(|b| Box::<dyn Payload>::from(b))
-            .collect()
-    }
-}
-
-impl CombinationWorkload {
-    pub fn new_boxed(
-        workloads: HashMap<WorkloadType, WeightAndPayload>,
-    ) -> Box<dyn Workload<dyn Payload>> {
-        Box::new(CombinationWorkload { workloads })
-    }
-}
-
-pub struct WorkloadInfo {
-    pub target_qps: u64,
-    pub num_workers: u64,
-    pub max_in_flight_ops: u64,
-    pub workload: Box<dyn Workload<dyn Payload>>,
 }
