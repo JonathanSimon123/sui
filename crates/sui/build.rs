@@ -1,24 +1,54 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{env, process::Command};
+use std::{env, fs::File};
+use std::{
+    io::{BufWriter, Write},
+    path::Path,
+};
+use sui_framework_snapshot::{load_bytecode_snapshot_manifest, manifest_path};
 
-/// Save revision info to environment variable
-fn main() {
-    if env::var("GIT_REVISION").is_err() {
-        let output = Command::new("git")
-            .args(["describe", "--always", "--dirty", "--exclude", "*"])
-            .output()
-            .unwrap();
-        if !output.status.success() {
-            panic!(
-                "failed to run git command: {}",
-                output.stderr.escape_ascii()
-            );
+/// Output a file `OUT_DIR/framework_version_table.rs` containing the contents of the manifest as a
+/// rust literal of type `[(ProtocolVersion, FrameworkVersion)]`. This is included as the
+/// static [framework_versions::VERSION_TABLE]
+fn generate_framework_version_table() -> anyhow::Result<()> {
+    let out_dir = env::var_os("OUT_DIR").unwrap();
+    let dest_path = Path::new(&out_dir).join("framework_version_table.rs");
+
+    let manifest_path = manifest_path().to_string_lossy().into_owned();
+    let manifest = load_bytecode_snapshot_manifest();
+
+    let mut file = BufWriter::new(File::create(&dest_path)?);
+
+    writeln!(&mut file, "[")?;
+
+    for (version, entry) in manifest.iter() {
+        let hash = &entry.git_revision;
+        writeln!(
+            &mut file,
+            "  (ProtocolVersion::new( {version:>2} ), FrameworkVersion {{"
+        )?;
+        writeln!(&mut file, "        git_revision: \"{hash}\".into(),")?;
+        writeln!(&mut file, "        packages: [")?;
+        for package in entry.packages.iter() {
+            writeln!(
+                &mut file,
+                "          FrameworkPackage {{ package_name: \"{}\".into(), repo_path: \"{}\".into() }},",
+                package.name,
+                package.path,
+            )?;
         }
-        let git_rev = String::from_utf8(output.stdout).unwrap().trim().to_owned();
-
-        println!("cargo:rustc-env=GIT_REVISION={}", git_rev);
-        println!("cargo:rerun-if-changed=build.rs");
+        writeln!(&mut file, "        ].into(),")?;
+        writeln!(&mut file, "      }}),")?;
     }
+
+    writeln!(&mut file, "]")?;
+
+    println!("cargo::rerun-if-changed={}", manifest_path);
+    println!("cargo::rerun-if-changed=build.rs");
+    Ok(())
+}
+
+fn main() {
+    generate_framework_version_table().unwrap();
 }

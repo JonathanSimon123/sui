@@ -3,40 +3,58 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::{
-    authority::authority_tests::{
-        call_move, call_move_with_shared, init_state_with_ids, send_and_confirm_transaction,
-        TestCallArg,
-    },
-    test_utils::to_sender_signed_transaction,
+use crate::authority::authority_tests::{
+    call_move, call_move_, execute_programmable_transaction, init_state_with_ids,
+    send_and_confirm_transaction, TestCallArg,
+};
+use move_core_types::{
+    account_address::AccountAddress,
+    identifier::{IdentStr, Identifier},
+    language_storage::StructTag,
+    u256::U256,
 };
 
-use move_core_types::{
-    language_storage::TypeTag,
-    value::{MoveStruct, MoveValue},
+use sui_types::{
+    base_types::{RESOLVED_ASCII_STR, RESOLVED_STD_OPTION, RESOLVED_UTF8_STR},
+    error::ExecutionErrorKind,
+    programmable_transaction_builder::ProgrammableTransactionBuilder,
+    utils::to_sender_signed_transaction,
+    SUI_FRAMEWORK_PACKAGE_ID,
 };
-use move_package::BuildConfig;
+
+use move_core_types::language_storage::TypeTag;
+
+use sui_move_build::{BuildConfig, SuiPackageHooks};
 use sui_types::{
     crypto::{get_key_pair, AccountKeyPair},
-    event::{Event, EventType, TransferType},
-    messages::ExecutionStatus,
-    object::OBJECT_START_VERSION,
+    error::SuiError,
 };
 
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 use std::{env, str::FromStr};
-
-const MAX_GAS: u64 = 10000;
+use sui_types::execution_status::{CommandArgumentError, ExecutionFailureStatus, ExecutionStatus};
+use sui_types::move_package::UpgradeCap;
 
 #[tokio::test]
+#[cfg_attr(msim, ignore)]
 async fn test_object_wrapping_unwrapping() {
+    telemetry_subscribers::init_for_testing();
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas = ObjectID::random();
     let authority = init_state_with_ids(vec![(sender, gas)]).await;
 
-    let package =
-        build_and_publish_test_package(&authority, &sender, &sender_key, &gas, "object_wrapping")
-            .await;
+    let package = build_and_publish_test_package(
+        &authority,
+        &sender,
+        &sender_key,
+        &gas,
+        "object_wrapping",
+        /* with_unpublished_deps */ false,
+    )
+    .await;
+
+    let gas_version = authority.get_object(&gas).await.unwrap().version();
+    let create_child_version = SequenceNumber::lamport_increment([gas_version]);
 
     // Create a Child object.
     let effects = call_move(
@@ -44,7 +62,7 @@ async fn test_object_wrapping_unwrapping() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "object_wrapping",
         "create_child",
         vec![],
@@ -53,12 +71,15 @@ async fn test_object_wrapping_unwrapping() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let child_object_ref = effects.created[0].0;
-    assert_eq!(child_object_ref.1, OBJECT_START_VERSION);
+    let child_object_ref = effects.created()[0].0;
+    assert_eq!(child_object_ref.1, create_child_version);
+
+    let wrapped_version =
+        SequenceNumber::lamport_increment([child_object_ref.1, effects.gas_object().0 .1]);
 
     // Create a Parent object, by wrapping the child object.
     let effects = call_move(
@@ -66,7 +87,7 @@ async fn test_object_wrapping_unwrapping() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "object_wrapping",
         "create_parent",
         vec![],
@@ -75,32 +96,35 @@ async fn test_object_wrapping_unwrapping() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
     // Child object is wrapped, Parent object is created.
     assert_eq!(
         (
-            effects.created.len(),
-            effects.deleted.len(),
-            effects.wrapped.len()
+            effects.created().len(),
+            effects.deleted().len(),
+            effects.unwrapped_then_deleted().len(),
+            effects.wrapped().len()
         ),
-        (1, 0, 1)
+        (1, 0, 0, 1)
     );
-    let new_child_object_ref = effects.wrapped[0];
+    let new_child_object_ref = effects.wrapped()[0];
     let expected_child_object_ref = (
         child_object_ref.0,
-        child_object_ref.1.increment(),
+        wrapped_version,
         ObjectDigest::OBJECT_DIGEST_WRAPPED,
     );
     // Make sure that the child's version gets increased after wrapped.
     assert_eq!(new_child_object_ref, expected_child_object_ref);
-    check_latest_object_ref(&authority, &expected_child_object_ref).await;
-    let child_object_ref = new_child_object_ref;
+    check_latest_object_ref(&authority, &expected_child_object_ref, true).await;
 
-    let parent_object_ref = effects.created[0].0;
-    assert_eq!(parent_object_ref.1, OBJECT_START_VERSION);
+    let parent_object_ref = effects.created()[0].0;
+    assert_eq!(parent_object_ref.1, wrapped_version);
+
+    let unwrapped_version =
+        SequenceNumber::lamport_increment([parent_object_ref.1, effects.gas_object().0 .1]);
 
     // Extract the child out of the parent.
     let effects = call_move(
@@ -108,7 +132,7 @@ async fn test_object_wrapping_unwrapping() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "object_wrapping",
         "extract_child",
         vec![],
@@ -117,24 +141,30 @@ async fn test_object_wrapping_unwrapping() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
     // Check that the child shows up in unwrapped, not created.
     // mutated contains parent and gas.
     assert_eq!(
         (
-            effects.mutated.len(),
-            effects.created.len(),
-            effects.unwrapped.len()
+            effects.mutated().len(),
+            effects.created().len(),
+            effects.unwrapped().len()
         ),
         (2, 0, 1)
     );
     // Make sure that version increments again when unwrapped.
-    assert_eq!(effects.unwrapped[0].0 .1, child_object_ref.1.increment());
-    check_latest_object_ref(&authority, &effects.unwrapped[0].0).await;
-    let child_object_ref = effects.unwrapped[0].0;
+    assert_eq!(effects.unwrapped()[0].0 .1, unwrapped_version);
+    check_latest_object_ref(&authority, &effects.unwrapped()[0].0, false).await;
+    let child_object_ref = effects.unwrapped()[0].0;
+
+    let rewrap_version = SequenceNumber::lamport_increment([
+        parent_object_ref.1,
+        child_object_ref.1,
+        effects.gas_object().0 .1,
+    ]);
 
     // Wrap the child to the parent again.
     let effects = call_move(
@@ -142,7 +172,7 @@ async fn test_object_wrapping_unwrapping() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "object_wrapping",
         "set_child",
         vec![],
@@ -154,22 +184,25 @@ async fn test_object_wrapping_unwrapping() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
     // Check that child object showed up in wrapped.
     // mutated contains parent and gas.
-    assert_eq!((effects.mutated.len(), effects.wrapped.len()), (2, 1));
+    assert_eq!((effects.mutated().len(), effects.wrapped().len()), (2, 1));
     let expected_child_object_ref = (
         child_object_ref.0,
-        child_object_ref.1.increment(),
+        rewrap_version,
         ObjectDigest::OBJECT_DIGEST_WRAPPED,
     );
-    assert_eq!(effects.wrapped[0], expected_child_object_ref);
-    check_latest_object_ref(&authority, &expected_child_object_ref).await;
-    let child_object_ref = effects.wrapped[0];
-    let parent_object_ref = effects.mutated_excluding_gas().next().unwrap().0;
+    assert_eq!(effects.wrapped()[0], expected_child_object_ref);
+    check_latest_object_ref(&authority, &expected_child_object_ref, true).await;
+    let child_object_ref = effects.wrapped()[0];
+    let parent_object_ref = effects.mutated_excluding_gas().first().unwrap().0;
+
+    let deleted_version =
+        SequenceNumber::lamport_increment([parent_object_ref.1, effects.gas_object().0 .1]);
 
     // Now delete the parent object, which will in turn delete the child object.
     let effects = call_move(
@@ -177,7 +210,7 @@ async fn test_object_wrapping_unwrapping() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "object_wrapping",
         "delete_parent",
         vec![],
@@ -186,37 +219,47 @@ async fn test_object_wrapping_unwrapping() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    assert_eq!(effects.deleted.len(), 2);
-    // Check that both objects are marked as wrapped in the authority.
+    assert_eq!(effects.deleted().len(), 1);
+    assert_eq!(effects.unwrapped_then_deleted().len(), 1);
+    // Check that both objects are marked as deleted in the authority.
     let expected_child_object_ref = (
         child_object_ref.0,
-        child_object_ref.1.increment(),
+        deleted_version,
         ObjectDigest::OBJECT_DIGEST_DELETED,
     );
-    assert!(effects.deleted.contains(&expected_child_object_ref));
-    check_latest_object_ref(&authority, &expected_child_object_ref).await;
+    assert!(effects
+        .unwrapped_then_deleted()
+        .contains(&expected_child_object_ref));
+    check_latest_object_ref(&authority, &expected_child_object_ref, true).await;
     let expected_parent_object_ref = (
         parent_object_ref.0,
-        parent_object_ref.1.increment(),
+        deleted_version,
         ObjectDigest::OBJECT_DIGEST_DELETED,
     );
-    assert!(effects.deleted.contains(&expected_parent_object_ref));
-    check_latest_object_ref(&authority, &expected_parent_object_ref).await;
+    assert!(effects.deleted().contains(&expected_parent_object_ref));
+    check_latest_object_ref(&authority, &expected_parent_object_ref, true).await;
 }
 
 #[tokio::test]
+#[cfg_attr(msim, ignore)]
 async fn test_object_owning_another_object() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas = ObjectID::random();
     let authority = init_state_with_ids(vec![(sender, gas)]).await;
 
-    let package =
-        build_and_publish_test_package(&authority, &sender, &sender_key, &gas, "object_owner")
-            .await;
+    let package = build_and_publish_test_package(
+        &authority,
+        &sender,
+        &sender_key,
+        &gas,
+        "object_owner",
+        /* with_unpublished_deps */ false,
+    )
+    .await;
 
     // Create a parent.
     let effects = call_move(
@@ -224,7 +267,7 @@ async fn test_object_owning_another_object() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "object_owner",
         "create_parent",
         vec![],
@@ -232,11 +275,8 @@ async fn test_object_owning_another_object() {
     )
     .await
     .unwrap();
-    assert!(effects.status.is_ok());
-    assert_eq!(effects.events.len(), 1);
-    assert_eq!(effects.events[0].event_type(), EventType::NewObject);
-    let parent = effects.created[0].0;
-    assert_eq!(effects.events[0].object_id(), Some(parent.0));
+    assert!(effects.status().is_ok());
+    let parent = effects.created()[0].0;
 
     // Create a child.
     let effects = call_move(
@@ -244,7 +284,7 @@ async fn test_object_owning_another_object() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "object_owner",
         "create_child",
         vec![],
@@ -252,10 +292,9 @@ async fn test_object_owning_another_object() {
     )
     .await
     .unwrap();
-    assert!(effects.status.is_ok());
-    assert_eq!(effects.events.len(), 1);
-    assert_eq!(effects.events[0].event_type(), EventType::NewObject);
-    let child = effects.created[0].0;
+
+    assert!(effects.status().is_ok());
+    let child = effects.created()[0].0;
 
     // Mutate the child directly should work fine.
     let effects = call_move(
@@ -263,7 +302,7 @@ async fn test_object_owning_another_object() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "object_owner",
         "mutate_child",
         vec![],
@@ -271,7 +310,7 @@ async fn test_object_owning_another_object() {
     )
     .await
     .unwrap();
-    assert!(effects.status.is_ok());
+    assert!(effects.status().is_ok());
 
     // Add the child to the parent.
     let effects = call_move(
@@ -279,7 +318,7 @@ async fn test_object_owning_another_object() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "object_owner",
         "add_child",
         vec![],
@@ -287,18 +326,21 @@ async fn test_object_owning_another_object() {
     )
     .await
     .unwrap();
-    effects.status.unwrap();
+    effects.status().unwrap();
     let child_effect = effects
-        .mutated
-        .iter()
+        .mutated()
+        .into_iter()
         .find(|((id, _, _), _)| id == &child.0)
         .unwrap();
     // Check that the child is now owned by the parent.
     let field_id = match child_effect.1 {
         Owner::ObjectOwner(field_id) => field_id.into(),
-        Owner::Shared { .. } | Owner::Immutable | Owner::AddressOwner(_) => panic!(),
+        Owner::Shared { .. }
+        | Owner::Immutable
+        | Owner::AddressOwner(_)
+        | Owner::ConsensusV2 { .. } => panic!(),
     };
-    let field_object = authority.get_object(&field_id).await.unwrap().unwrap();
+    let field_object = authority.get_object(&field_id).await.unwrap();
     assert_eq!(field_object.owner, parent.0);
 
     // Mutate the child directly will now fail because we need the parent to authenticate.
@@ -307,7 +349,7 @@ async fn test_object_owning_another_object() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "object_owner",
         "mutate_child",
         vec![],
@@ -322,7 +364,7 @@ async fn test_object_owning_another_object() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "object_owner",
         "mutate_child_with_parent",
         vec![],
@@ -330,6 +372,7 @@ async fn test_object_owning_another_object() {
     )
     .await;
     assert!(effects.is_err());
+    assert!(format!("{effects:?}").contains("InvalidChildObjectArgument"));
 
     // Create another parent.
     let effects = call_move(
@@ -337,7 +380,7 @@ async fn test_object_owning_another_object() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "object_owner",
         "create_parent",
         vec![],
@@ -345,10 +388,9 @@ async fn test_object_owning_another_object() {
     )
     .await
     .unwrap();
-    assert!(effects.status.is_ok());
-    assert_eq!(effects.events.len(), 1);
-    assert_eq!(effects.events[0].event_type(), EventType::NewObject);
-    let new_parent = effects.created[0].0;
+
+    assert!(effects.status().is_ok());
+    let new_parent = effects.created()[0].0;
 
     // Transfer the child to the new_parent.
     let effects = call_move(
@@ -356,7 +398,7 @@ async fn test_object_owning_another_object() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "object_owner",
         "transfer_child",
         vec![],
@@ -367,49 +409,8 @@ async fn test_object_owning_another_object() {
     )
     .await
     .unwrap();
-    assert!(effects.status.is_ok());
-    assert_eq!(effects.events.len(), 3);
-    let num_transfers = effects
-        .events
-        .iter()
-        .filter(|e| matches!(e.event_type(), EventType::TransferObject { .. }))
-        .count();
-    assert_eq!(num_transfers, 2);
-    let num_created = effects
-        .events
-        .iter()
-        .filter(|e| matches!(e.event_type(), EventType::NewObject { .. }))
-        .count();
-    assert_eq!(num_created, 1);
-    let child_event = effects
-        .events
-        .iter()
-        .find(|e| e.object_id() == Some(child.0))
-        .unwrap();
-    let (recipient, type_) = match *child_event {
-        Event::TransferObject {
-            recipient, type_, ..
-        } => (recipient, type_),
-        _ => panic!("Unexpected event type: {:?}", child_event),
-    };
-    assert_eq!(type_, TransferType::ToObject);
-    let new_field_id = match recipient {
-        Owner::ObjectOwner(field_id) => field_id.into(),
-        Owner::Shared { .. } | Owner::Immutable | Owner::AddressOwner(_) => panic!(),
-    };
-    let new_field_object = authority.get_object(&new_field_id).await.unwrap().unwrap();
-    assert_eq!(
-        new_field_object.owner,
-        Owner::ObjectOwner(new_parent.0.into())
-    );
 
-    let child_effect = effects
-        .mutated
-        .iter()
-        .find(|((id, _, _), _)| id == &child.0)
-        .unwrap();
-    // Check that the child is now owned by the new parent.
-    assert_eq!(child_effect.1, new_field_id);
+    assert!(effects.status().is_ok());
 
     // Delete the child. This should fail as the child cannot be used as a transaction argument
     let effects = call_move(
@@ -417,7 +418,7 @@ async fn test_object_owning_another_object() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "object_owner",
         "delete_child",
         vec![],
@@ -428,212 +429,8 @@ async fn test_object_owning_another_object() {
 }
 
 #[tokio::test]
+#[cfg_attr(msim, ignore)]
 async fn test_create_then_delete_parent_child() {
-    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
-    let gas = ObjectID::random();
-    let authority = init_state_with_ids(vec![(sender, gas)]).await;
-
-    let package =
-        build_and_publish_test_package(&authority, &sender, &sender_key, &gas, "object_owner")
-            .await;
-
-    // Create a parent and a child together
-    let effects = call_move(
-        &authority,
-        &gas,
-        &sender,
-        &sender_key,
-        &package,
-        "object_owner",
-        "create_parent_and_child",
-        vec![],
-        vec![],
-    )
-    .await
-    .unwrap();
-    assert!(effects.status.is_ok());
-    // Creates 3 objects, the parent, a field, and the child
-    assert_eq!(effects.created.len(), 3);
-    assert_eq!(effects.events.len(), 3);
-    let parent = effects
-        .created
-        .iter()
-        .find(|(_, owner)| matches!(owner, Owner::AddressOwner(_)))
-        .unwrap()
-        .0;
-
-    // Delete the parent and child altogether.
-    let effects = call_move(
-        &authority,
-        &gas,
-        &sender,
-        &sender_key,
-        &package,
-        "object_owner",
-        "delete_parent_and_child",
-        vec![],
-        vec![TestCallArg::Object(parent.0)],
-    )
-    .await
-    .unwrap();
-    assert!(effects.status.is_ok());
-    // Check that both objects were deleted.
-    // TODO field object should be deleted too
-    assert_eq!(effects.deleted.len(), 2);
-    assert_eq!(effects.events.len(), 3);
-}
-
-#[tokio::test]
-async fn test_create_then_delete_parent_child_wrap() {
-    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
-    let gas = ObjectID::random();
-    let authority = init_state_with_ids(vec![(sender, gas)]).await;
-
-    let package =
-        build_and_publish_test_package(&authority, &sender, &sender_key, &gas, "object_owner")
-            .await;
-
-    // Create a parent and a child together
-    let effects = call_move(
-        &authority,
-        &gas,
-        &sender,
-        &sender_key,
-        &package,
-        "object_owner",
-        "create_parent_and_child_wrapped",
-        vec![],
-        vec![],
-    )
-    .await
-    .unwrap();
-    assert!(effects.status.is_ok());
-    // Creates 3 objects, the parent, a field, and the child
-    assert_eq!(effects.created.len(), 2);
-    // not wrapped as it wasn't first created
-    assert_eq!(effects.wrapped.len(), 0);
-    assert_eq!(effects.events.len(), 2);
-
-    let parent = effects
-        .created
-        .iter()
-        .find(|(_, owner)| matches!(owner, Owner::AddressOwner(_)))
-        .unwrap()
-        .0;
-
-    // Delete the parent and child altogether.
-    let effects = call_move(
-        &authority,
-        &gas,
-        &sender,
-        &sender_key,
-        &package,
-        "object_owner",
-        "delete_parent_and_child_wrapped",
-        vec![],
-        vec![TestCallArg::Object(parent.0)],
-    )
-    .await
-    .unwrap();
-    assert!(effects.status.is_ok());
-    // Check that both objects were deleted.
-    // TODO field object should be deleted too
-    assert_eq!(effects.deleted.len(), 2);
-    assert_eq!(effects.events.len(), 3);
-}
-
-#[tokio::test]
-async fn test_create_then_delete_parent_child_wrap_separate() {
-    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
-    let gas = ObjectID::random();
-    let authority = init_state_with_ids(vec![(sender, gas)]).await;
-
-    let package =
-        build_and_publish_test_package(&authority, &sender, &sender_key, &gas, "object_owner")
-            .await;
-
-    // Create a parent.
-    let effects = call_move(
-        &authority,
-        &gas,
-        &sender,
-        &sender_key,
-        &package,
-        "object_owner",
-        "create_parent",
-        vec![],
-        vec![],
-    )
-    .await
-    .unwrap();
-    assert!(effects.status.is_ok());
-    assert_eq!(effects.events.len(), 1);
-    assert_eq!(effects.events[0].event_type(), EventType::NewObject);
-    let parent = effects.created[0].0;
-    assert_eq!(effects.events[0].object_id(), Some(parent.0));
-
-    // Create a child.
-    let effects = call_move(
-        &authority,
-        &gas,
-        &sender,
-        &sender_key,
-        &package,
-        "object_owner",
-        "create_child",
-        vec![],
-        vec![],
-    )
-    .await
-    .unwrap();
-    assert!(effects.status.is_ok());
-    assert_eq!(effects.events.len(), 1);
-    assert_eq!(effects.events[0].event_type(), EventType::NewObject);
-    let child = effects.created[0].0;
-
-    // Add the child to the parent.
-    println!("add_child_wrapped");
-    let effects = call_move(
-        &authority,
-        &gas,
-        &sender,
-        &sender_key,
-        &package,
-        "object_owner",
-        "add_child_wrapped",
-        vec![],
-        vec![TestCallArg::Object(parent.0), TestCallArg::Object(child.0)],
-    )
-    .await
-    .unwrap();
-    assert!(effects.status.is_ok());
-    assert_eq!(effects.created.len(), 1);
-    assert_eq!(effects.wrapped.len(), 1);
-    assert_eq!(effects.events.len(), 2);
-
-    // Delete the parent and child altogether.
-    let effects = call_move(
-        &authority,
-        &gas,
-        &sender,
-        &sender_key,
-        &package,
-        "object_owner",
-        "delete_parent_and_child_wrapped",
-        vec![],
-        vec![TestCallArg::Object(parent.0)],
-    )
-    .await
-    .unwrap();
-    assert!(effects.status.is_ok());
-    // Check that both objects were deleted.
-    // TODO field object should be deleted too
-    assert_eq!(effects.deleted.len(), 2);
-    assert_eq!(effects.events.len(), 3);
-}
-
-#[tokio::test]
-async fn test_entry_point_vector_empty() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas = ObjectID::random();
     let authority = init_state_with_ids(vec![(sender, gas)]).await;
@@ -643,54 +440,479 @@ async fn test_entry_point_vector_empty() {
         &sender,
         &sender_key,
         &gas,
-        "entry_point_vector",
+        "object_owner",
+        /* with_unpublished_deps */ false,
     )
     .await;
 
-    // call a function with an empty vector
+    // Create a parent and a child together
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
-        "entry_point_vector",
-        "obj_vec_empty",
+        &package.0,
+        "object_owner",
+        "create_parent_and_child",
         vec![],
-        vec![TestCallArg::ObjVec(vec![])],
+        vec![],
     )
     .await
     .unwrap();
-    assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
-        "{:?}",
-        effects.status
-    );
 
-    // call a function with an empty vector whose type is generic
-    let type_tag =
-        TypeTag::from_str(format!("{}::entry_point_vector::Obj", package.0).as_str()).unwrap();
+    assert!(effects.status().is_ok());
+    // Creates 3 objects, the parent, a field, and the child
+    assert_eq!(effects.created().len(), 3);
+    let parent = effects
+        .created()
+        .iter()
+        .find(|(_, owner)| matches!(owner, Owner::AddressOwner(_)))
+        .unwrap()
+        .0;
+
+    // Delete the parent and child altogether.
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
-        "entry_point_vector",
-        "type_param_vec_empty",
-        vec![type_tag],
-        vec![TestCallArg::ObjVec(vec![])],
+        &package.0,
+        "object_owner",
+        "delete_parent_and_child",
+        vec![],
+        vec![TestCallArg::Object(parent.0)],
     )
     .await
     .unwrap();
-    assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
-        "{:?}",
-        effects.status
+    assert!(effects.status().is_ok());
+    // Check that both objects were deleted.
+    assert_eq!(effects.deleted().len(), 3);
+}
+
+#[tokio::test]
+#[cfg_attr(msim, ignore)]
+async fn test_create_then_delete_parent_child_wrap() {
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+    let gas = ObjectID::random();
+    let authority = init_state_with_ids(vec![(sender, gas)]).await;
+
+    let package = build_and_publish_test_package(
+        &authority,
+        &sender,
+        &sender_key,
+        &gas,
+        "object_owner",
+        /* with_unpublished_deps */ false,
+    )
+    .await;
+
+    // Create a parent and a child together
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "object_owner",
+        "create_parent_and_child_wrapped",
+        vec![],
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    assert!(effects.status().is_ok());
+    // Modifies the gas object
+    assert_eq!(effects.mutated().len(), 1);
+    // Creates 3 objects, the parent, a field, and the child
+    assert_eq!(effects.created().len(), 2);
+    // not wrapped as it wasn't first created
+    assert_eq!(effects.wrapped().len(), 0);
+
+    let gas_ref = effects.mutated()[0].0;
+
+    let parent = effects
+        .created()
+        .iter()
+        .find(|(_, owner)| matches!(owner, Owner::AddressOwner(_)))
+        .unwrap()
+        .0;
+
+    let field = effects
+        .created()
+        .iter()
+        .find(|((id, _, _), _)| id != &parent.0)
+        .unwrap()
+        .0;
+
+    // Delete the parent and child altogether.
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "object_owner",
+        "delete_parent_and_child_wrapped",
+        vec![],
+        vec![TestCallArg::Object(parent.0)],
+    )
+    .await
+    .unwrap();
+
+    assert!(effects.status().is_ok());
+
+    // The parent and field are considered deleted, the child doesn't count because it wasn't
+    // considered created in the first place.
+    assert_eq!(effects.deleted().len(), 2);
+    // The child is considered as unwrapped and deleted, even though it was wrapped since creation.
+    assert_eq!(effects.unwrapped_then_deleted().len(), 1);
+
+    assert_eq!(
+        effects
+            .modified_at_versions()
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        HashSet::from([
+            (gas_ref.0, gas_ref.1),
+            (parent.0, parent.1),
+            (field.0, field.1)
+        ]),
+    );
+}
+
+/// We are explicitly testing the case where a parent and child object are created together - where
+/// no prior child version exists - and then we remove the child successfully.
+#[tokio::test]
+#[cfg_attr(msim, ignore)]
+async fn test_remove_child_when_no_prior_version_exists() {
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+    let gas = ObjectID::random();
+    let authority = init_state_with_ids(vec![(sender, gas)]).await;
+
+    let package = build_and_publish_test_package(
+        &authority,
+        &sender,
+        &sender_key,
+        &gas,
+        "object_owner",
+        /* with_unpublished_deps */ false,
+    )
+    .await;
+
+    // Create a parent and a child together
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "object_owner",
+        "create_parent_and_child_wrapped",
+        vec![],
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    assert!(effects.status().is_ok());
+    // Modifies the gas object
+    assert_eq!(effects.mutated().len(), 1);
+    // Creates 3 objects, the parent, a field, and the child
+    assert_eq!(effects.created().len(), 2);
+    // not wrapped as it wasn't first created
+    assert_eq!(effects.wrapped().len(), 0);
+
+    let gas_ref = effects.mutated()[0].0;
+
+    let parent = effects
+        .created()
+        .iter()
+        .find(|(_, owner)| matches!(owner, Owner::AddressOwner(_)))
+        .unwrap()
+        .0;
+
+    let field = effects
+        .created()
+        .iter()
+        .find(|((id, _, _), _)| id != &parent.0)
+        .unwrap()
+        .0;
+
+    // Delete the child only
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "object_owner",
+        "remove_wrapped_child",
+        vec![],
+        vec![TestCallArg::Object(parent.0)],
+    )
+    .await
+    .unwrap();
+
+    assert!(effects.status().is_ok());
+
+    // The field is considered deleted. The child doesn't count because it wasn't
+    // considered created in the first place.
+    assert_eq!(effects.deleted().len(), 1);
+    // The child was never created so it is not unwrapped.
+    assert_eq!(effects.unwrapped_then_deleted().len(), 0);
+
+    assert_eq!(
+        effects
+            .modified_at_versions()
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        HashSet::from([
+            (gas_ref.0, gas_ref.1),
+            (parent.0, parent.1),
+            (field.0, field.1)
+        ]),
     );
 }
 
 #[tokio::test]
+#[cfg_attr(msim, ignore)]
+async fn test_create_then_delete_parent_child_wrap_separate() {
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+    let gas = ObjectID::random();
+    let authority = init_state_with_ids(vec![(sender, gas)]).await;
+
+    let package = build_and_publish_test_package(
+        &authority,
+        &sender,
+        &sender_key,
+        &gas,
+        "object_owner",
+        /* with_unpublished_deps */ false,
+    )
+    .await;
+
+    // Create a parent.
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "object_owner",
+        "create_parent",
+        vec![],
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    assert!(effects.status().is_ok());
+    let parent = effects.created()[0].0;
+
+    // Create a child.
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "object_owner",
+        "create_child",
+        vec![],
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    assert!(effects.status().is_ok());
+    let child = effects.created()[0].0;
+
+    // Add the child to the parent.
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "object_owner",
+        "add_child_wrapped",
+        vec![],
+        vec![TestCallArg::Object(parent.0), TestCallArg::Object(child.0)],
+    )
+    .await
+    .unwrap();
+
+    assert!(effects.status().is_ok());
+    assert_eq!(effects.created().len(), 1);
+    assert_eq!(effects.wrapped().len(), 1);
+
+    // Delete the parent and child altogether.
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "object_owner",
+        "delete_parent_and_child_wrapped",
+        vec![],
+        vec![TestCallArg::Object(parent.0)],
+    )
+    .await
+    .unwrap();
+
+    assert!(effects.status().is_ok());
+    // Check that parent object was deleted.
+    assert_eq!(effects.deleted().len(), 2);
+    // Check that child object was unwrapped and deleted.
+    assert_eq!(effects.unwrapped_then_deleted().len(), 1);
+}
+
+#[tokio::test]
+#[cfg_attr(msim, ignore)]
+async fn test_entry_point_vector_empty() {
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+    let gas = ObjectID::random();
+    let authority = init_state_with_ids(vec![(sender, gas)]).await;
+    let rgp = authority.reference_gas_price_for_testing().unwrap();
+
+    let package = build_and_publish_test_package(
+        &authority,
+        &sender,
+        &sender_key,
+        &gas,
+        "entry_point_vector",
+        /* with_unpublished_deps */ false,
+    )
+    .await;
+
+    // call a function with an empty vector
+    let type_tag =
+        TypeTag::from_str(format!("{}::entry_point_vector::Obj", package.0).as_str()).unwrap();
+    let pt = {
+        let mut builder = ProgrammableTransactionBuilder::new();
+        let empty_vec =
+            builder.command(Command::MakeMoveVec(Some(type_tag.clone().into()), vec![]));
+        builder.programmable_move_call(
+            package.0,
+            Identifier::new("entry_point_vector").unwrap(),
+            Identifier::new("obj_vec_empty").unwrap(),
+            vec![],
+            vec![empty_vec],
+        );
+        builder.finish()
+    };
+    let effects = execute_programmable_transaction(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        pt,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
+        "{:?}",
+        effects.status()
+    );
+
+    // call a function with an empty vector whose type is generic
+    let pt = {
+        let mut builder = ProgrammableTransactionBuilder::new();
+        let empty_vec =
+            builder.command(Command::MakeMoveVec(Some(type_tag.clone().into()), vec![]));
+        builder.programmable_move_call(
+            package.0,
+            Identifier::new("entry_point_vector").unwrap(),
+            Identifier::new("type_param_vec_empty").unwrap(),
+            vec![type_tag.clone()],
+            vec![empty_vec],
+        );
+        builder.finish()
+    };
+    let effects = execute_programmable_transaction(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        pt,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
+        "{:?}",
+        effects.status()
+    );
+
+    // same tests again without the type tag
+    // call a function with an empty vector, no type tag
+    let pt = {
+        let mut builder = ProgrammableTransactionBuilder::new();
+        let empty_vec = builder.command(Command::MakeMoveVec(None, vec![]));
+        builder.programmable_move_call(
+            package.0,
+            Identifier::new("entry_point_vector").unwrap(),
+            Identifier::new("obj_vec_empty").unwrap(),
+            vec![],
+            vec![empty_vec],
+        );
+        builder.finish()
+    };
+    let err = execute_programmable_transaction(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        pt,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        SuiError::UserInputError {
+            error: UserInputError::EmptyCommandInput
+        }
+    );
+
+    // call a function with an empty vector whose type is generic
+    let pt = {
+        let mut builder = ProgrammableTransactionBuilder::new();
+        let empty_vec = builder.command(Command::MakeMoveVec(None, vec![]));
+        builder.programmable_move_call(
+            package.0,
+            Identifier::new("entry_point_vector").unwrap(),
+            Identifier::new("type_param_vec_empty").unwrap(),
+            vec![type_tag],
+            vec![empty_vec],
+        );
+        builder.finish()
+    };
+    let err = execute_programmable_transaction(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        pt,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        SuiError::UserInputError {
+            error: UserInputError::EmptyCommandInput
+        }
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(msim, ignore)]
 async fn test_entry_point_vector_primitive() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas = ObjectID::random();
@@ -702,6 +924,7 @@ async fn test_entry_point_vector_primitive() {
         &sender_key,
         &gas,
         "entry_point_vector",
+        /* with_unpublished_deps */ false,
     )
     .await;
 
@@ -711,7 +934,7 @@ async fn test_entry_point_vector_primitive() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "prim_vec_len",
         vec![],
@@ -722,13 +945,14 @@ async fn test_entry_point_vector_primitive() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
 }
 
 #[tokio::test]
+#[cfg_attr(msim, ignore)]
 async fn test_entry_point_vector() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas = ObjectID::random();
@@ -740,6 +964,7 @@ async fn test_entry_point_vector() {
         &sender_key,
         &gas,
         "entry_point_vector",
+        /* with_unpublished_deps */ false,
     )
     .await;
 
@@ -749,7 +974,7 @@ async fn test_entry_point_vector() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint",
         vec![],
@@ -758,18 +983,18 @@ async fn test_entry_point_vector() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (obj_id, _, _) = effects.created[0].0;
+    let (obj_id, _, _) = effects.created()[0].0;
     // call a function with a vector containing one owned object
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "obj_vec_destroy",
         vec![],
@@ -778,9 +1003,9 @@ async fn test_entry_point_vector() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
 
     // mint a parent object and a child object and make sure that parent stored in the vector
@@ -790,7 +1015,7 @@ async fn test_entry_point_vector() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint",
         vec![],
@@ -799,17 +1024,17 @@ async fn test_entry_point_vector() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (parent_id, _, _) = effects.created[0].0;
+    let (parent_id, _, _) = effects.created()[0].0;
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint_child",
         vec![],
@@ -821,11 +1046,11 @@ async fn test_entry_point_vector() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (child_id, _, _) = effects.created[0].0;
+    let (child_id, _, _) = effects.created()[0].0;
     // call a function with a vector containing the same owned object as another one passed as
     // a reference argument
     let effects = call_move(
@@ -833,7 +1058,7 @@ async fn test_entry_point_vector() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "child_access",
         vec![],
@@ -842,16 +1067,13 @@ async fn test_entry_point_vector() {
             TestCallArg::ObjVec(vec![parent_id]),
         ],
     )
-    .await
-    .unwrap();
-    assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
-        "{:?}",
-        effects.status
-    );
+    .await;
+    assert!(effects.is_err());
+    assert!(format!("{effects:?}").contains("InvalidChildObjectArgument"));
 }
 
 #[tokio::test]
+#[cfg_attr(msim, ignore)]
 async fn test_entry_point_vector_error() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas = ObjectID::random();
@@ -863,6 +1085,7 @@ async fn test_entry_point_vector_error() {
         &sender_key,
         &gas,
         "entry_point_vector",
+        /* with_unpublished_deps */ false,
     )
     .await;
 
@@ -872,7 +1095,7 @@ async fn test_entry_point_vector_error() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint_another",
         vec![],
@@ -881,18 +1104,18 @@ async fn test_entry_point_vector_error() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (obj_id, _, _) = effects.created[0].0;
+    let (obj_id, _, _) = effects.created()[0].0;
     // call a function with a vector containing one owned object
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "obj_vec_destroy",
         vec![],
@@ -902,9 +1125,9 @@ async fn test_entry_point_vector_error() {
     .unwrap();
     // should fail as we passed object of the wrong type
     assert!(
-        matches!(effects.status, ExecutionStatus::Failure { .. }),
+        matches!(effects.status(), ExecutionStatus::Failure { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
 
     // mint two objects - one of a wrong type and one of the correct type
@@ -913,7 +1136,7 @@ async fn test_entry_point_vector_error() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint_another",
         vec![],
@@ -922,17 +1145,17 @@ async fn test_entry_point_vector_error() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (wrong_obj_id, _, _) = effects.created[0].0;
+    let (wrong_obj_id, _, _) = effects.created()[0].0;
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint",
         vec![],
@@ -941,18 +1164,18 @@ async fn test_entry_point_vector_error() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (correct_obj_id, _, _) = effects.created[0].0;
+    let (correct_obj_id, _, _) = effects.created()[0].0;
     // call a function with a vector containing one owned object
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "two_obj_vec_destroy",
         vec![],
@@ -962,9 +1185,9 @@ async fn test_entry_point_vector_error() {
     .unwrap();
     // should fail as we passed object of the wrong type as the first element of the vector
     assert!(
-        matches!(effects.status, ExecutionStatus::Failure { .. }),
+        matches!(effects.status(), ExecutionStatus::Failure { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
 
     // mint a shared object
@@ -973,7 +1196,7 @@ async fn test_entry_point_vector_error() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint_shared",
         vec![],
@@ -982,18 +1205,19 @@ async fn test_entry_point_vector_error() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (shared_obj_id, _, _) = effects.created[0].0;
+    let (shared_obj_id, _, _) = effects.created()[0].0;
     // call a function with a vector containing one shared object
-    let effects = call_move_with_shared(
+    let effects = call_move_(
         &authority,
+        None,
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "obj_vec_destroy",
         vec![],
@@ -1002,11 +1226,11 @@ async fn test_entry_point_vector_error() {
     )
     .await
     .unwrap();
-    // should fail as we do not support shared objects in vectors
+    // support shared objects in vectors
     assert!(
-        matches!(effects.status, ExecutionStatus::Failure { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
 
     // mint an owned object
@@ -1015,7 +1239,7 @@ async fn test_entry_point_vector_error() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint",
         vec![],
@@ -1024,11 +1248,11 @@ async fn test_entry_point_vector_error() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (obj_id, _, _) = effects.created[0].0;
+    let (obj_id, _, _) = effects.created()[0].0;
     // call a function with a vector containing the same owned object as another one passed as
     // argument
     let result = call_move(
@@ -1036,7 +1260,7 @@ async fn test_entry_point_vector_error() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "same_objects",
         vec![],
@@ -1047,13 +1271,15 @@ async fn test_entry_point_vector_error() {
     )
     .await;
     // should fail as we have the same object passed in vector and as a separate by-value argument
-    assert!(
-        matches!(
-            result.clone().err().unwrap(),
-            SuiError::DuplicateObjectRefInput { .. }
-        ),
-        "{:?}",
-        result
+    assert_eq!(
+        result.unwrap().status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionErrorKind::CommandArgumentError {
+                arg_idx: 0,
+                kind: CommandArgumentError::InvalidValueUsage,
+            },
+            command: Some(1)
+        }
     );
 
     // mint an owned object
@@ -1062,7 +1288,7 @@ async fn test_entry_point_vector_error() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint",
         vec![],
@@ -1071,11 +1297,11 @@ async fn test_entry_point_vector_error() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (obj_id, _, _) = effects.created[0].0;
+    let (obj_id, _, _) = effects.created()[0].0;
     // call a function with a vector containing the same owned object as another one passed as
     // a reference argument
     let result = call_move(
@@ -1083,7 +1309,7 @@ async fn test_entry_point_vector_error() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "same_objects_ref",
         vec![],
@@ -1094,17 +1320,20 @@ async fn test_entry_point_vector_error() {
     )
     .await;
     // should fail as we have the same object passed in vector and as a separate by-reference argument
-    assert!(
-        matches!(
-            result.clone().err().unwrap(),
-            SuiError::DuplicateObjectRefInput { .. }
-        ),
-        "{:?}",
-        result
+    assert_eq!(
+        result.unwrap().status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionErrorKind::CommandArgumentError {
+                arg_idx: 0,
+                kind: CommandArgumentError::InvalidValueUsage,
+            },
+            command: Some(1)
+        }
     );
 }
 
 #[tokio::test]
+#[cfg_attr(msim, ignore)]
 async fn test_entry_point_vector_any() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas = ObjectID::random();
@@ -1116,6 +1345,7 @@ async fn test_entry_point_vector_any() {
         &sender_key,
         &gas,
         "entry_point_vector",
+        /* with_unpublished_deps */ false,
     )
     .await;
 
@@ -1128,7 +1358,7 @@ async fn test_entry_point_vector_any() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint_any",
         vec![any_type_tag.clone()],
@@ -1137,18 +1367,18 @@ async fn test_entry_point_vector_any() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (obj_id, _, _) = effects.created[0].0;
+    let (obj_id, _, _) = effects.created()[0].0;
     // call a function with a vector containing one owned object
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "obj_vec_destroy_any",
         vec![any_type_tag.clone()],
@@ -1157,9 +1387,9 @@ async fn test_entry_point_vector_any() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
 
     // mint a parent object and a child object and make sure that parent stored in the vector
@@ -1169,7 +1399,7 @@ async fn test_entry_point_vector_any() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint_any",
         vec![any_type_tag.clone()],
@@ -1178,17 +1408,17 @@ async fn test_entry_point_vector_any() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (parent_id, _, _) = effects.created[0].0;
+    let (parent_id, _, _) = effects.created()[0].0;
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint_child_any",
         vec![any_type_tag.clone()],
@@ -1200,11 +1430,11 @@ async fn test_entry_point_vector_any() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (child_id, _, _) = effects.created[0].0;
+    let (child_id, _, _) = effects.created()[0].0;
     // call a function with a vector containing the same owned object as another one passed as
     // a reference argument
     let effects = call_move(
@@ -1212,7 +1442,7 @@ async fn test_entry_point_vector_any() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "child_access_any",
         vec![any_type_tag],
@@ -1221,16 +1451,13 @@ async fn test_entry_point_vector_any() {
             TestCallArg::ObjVec(vec![parent_id]),
         ],
     )
-    .await
-    .unwrap();
-    assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
-        "{:?}",
-        effects.status
-    );
+    .await;
+    assert!(effects.is_err());
+    assert!(format!("{effects:?}").contains("InvalidChildObjectArgument"));
 }
 
 #[tokio::test]
+#[cfg_attr(msim, ignore)]
 async fn test_entry_point_vector_any_error() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas = ObjectID::random();
@@ -1242,6 +1469,7 @@ async fn test_entry_point_vector_any_error() {
         &sender_key,
         &gas,
         "entry_point_vector",
+        /* with_unpublished_deps */ false,
     )
     .await;
 
@@ -1254,7 +1482,7 @@ async fn test_entry_point_vector_any_error() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint_another_any",
         vec![any_type_tag.clone()],
@@ -1263,18 +1491,18 @@ async fn test_entry_point_vector_any_error() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (obj_id, _, _) = effects.created[0].0;
+    let (obj_id, _, _) = effects.created()[0].0;
     // call a function with a vector containing one owned object
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "obj_vec_destroy_any",
         vec![any_type_tag.clone()],
@@ -1284,9 +1512,9 @@ async fn test_entry_point_vector_any_error() {
     .unwrap();
     // should fail as we passed object of the wrong type
     assert!(
-        matches!(effects.status, ExecutionStatus::Failure { .. }),
+        matches!(effects.status(), ExecutionStatus::Failure { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
 
     // mint two objects - one of a wrong type and one of the correct type
@@ -1295,7 +1523,7 @@ async fn test_entry_point_vector_any_error() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint_another_any",
         vec![any_type_tag.clone()],
@@ -1304,17 +1532,17 @@ async fn test_entry_point_vector_any_error() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (wrong_obj_id, _, _) = effects.created[0].0;
+    let (wrong_obj_id, _, _) = effects.created()[0].0;
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint_any",
         vec![any_type_tag.clone()],
@@ -1323,18 +1551,18 @@ async fn test_entry_point_vector_any_error() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (correct_obj_id, _, _) = effects.created[0].0;
+    let (correct_obj_id, _, _) = effects.created()[0].0;
     // call a function with a vector containing one owned object
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "two_obj_vec_destroy_any",
         vec![any_type_tag.clone()],
@@ -1344,9 +1572,9 @@ async fn test_entry_point_vector_any_error() {
     .unwrap();
     // should fail as we passed object of the wrong type as the first element of the vector
     assert!(
-        matches!(effects.status, ExecutionStatus::Failure { .. }),
+        matches!(effects.status(), ExecutionStatus::Failure { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
 
     // mint a shared object
@@ -1355,7 +1583,7 @@ async fn test_entry_point_vector_any_error() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint_shared_any",
         vec![any_type_tag.clone()],
@@ -1364,18 +1592,19 @@ async fn test_entry_point_vector_any_error() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (shared_obj_id, _, _) = effects.created[0].0;
+    let (shared_obj_id, _, _) = effects.created()[0].0;
     // call a function with a vector containing one shared object
-    let effects = call_move_with_shared(
+    let effects = call_move_(
         &authority,
+        None,
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "obj_vec_destroy_any",
         vec![any_type_tag.clone()],
@@ -1384,11 +1613,11 @@ async fn test_entry_point_vector_any_error() {
     )
     .await
     .unwrap();
-    // should fail as we do not support shared objects in vectors
+    // support shared objects in vectors
     assert!(
-        matches!(effects.status, ExecutionStatus::Failure { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
 
     // mint an owned object
@@ -1397,7 +1626,7 @@ async fn test_entry_point_vector_any_error() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint_any",
         vec![any_type_tag.clone()],
@@ -1406,11 +1635,11 @@ async fn test_entry_point_vector_any_error() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (obj_id, _, _) = effects.created[0].0;
+    let (obj_id, _, _) = effects.created()[0].0;
     // call a function with a vector containing the same owned object as another one passed as
     // argument
     let result = call_move(
@@ -1418,7 +1647,7 @@ async fn test_entry_point_vector_any_error() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "same_objects_any",
         vec![any_type_tag.clone()],
@@ -1429,13 +1658,15 @@ async fn test_entry_point_vector_any_error() {
     )
     .await;
     // should fail as we have the same object passed in vector and as a separate by-value argument
-    assert!(
-        matches!(
-            result.clone().err().unwrap(),
-            SuiError::DuplicateObjectRefInput { .. }
-        ),
-        "{:?}",
-        result
+    assert_eq!(
+        result.unwrap().status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionErrorKind::CommandArgumentError {
+                arg_idx: 0,
+                kind: CommandArgumentError::InvalidValueUsage,
+            },
+            command: Some(1)
+        }
     );
 
     // mint an owned object
@@ -1444,7 +1675,7 @@ async fn test_entry_point_vector_any_error() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "mint_any",
         vec![any_type_tag.clone()],
@@ -1453,11 +1684,11 @@ async fn test_entry_point_vector_any_error() {
     .await
     .unwrap();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    let (obj_id, _, _) = effects.created[0].0;
+    let (obj_id, _, _) = effects.created()[0].0;
     // call a function with a vector containing the same owned object as another one passed as
     // a reference argument
     let result = call_move(
@@ -1465,7 +1696,7 @@ async fn test_entry_point_vector_any_error() {
         &gas,
         &sender,
         &sender_key,
-        &package,
+        &package.0,
         "entry_point_vector",
         "same_objects_ref_any",
         vec![any_type_tag.clone()],
@@ -1475,17 +1706,20 @@ async fn test_entry_point_vector_any_error() {
         ],
     )
     .await;
-    assert!(
-        matches!(
-            result.clone().err().unwrap(),
-            SuiError::DuplicateObjectRefInput { .. }
-        ),
-        "{:?}",
-        result
+    assert_eq!(
+        result.unwrap().status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionErrorKind::CommandArgumentError {
+                arg_idx: 0,
+                kind: CommandArgumentError::InvalidValueUsage,
+            },
+            command: Some(1)
+        }
     );
 }
 
 #[tokio::test]
+#[cfg_attr(msim, ignore)]
 async fn test_entry_point_string() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas = ObjectID::random();
@@ -1496,74 +1730,224 @@ async fn test_entry_point_string() {
         &sender,
         &sender_key,
         &gas,
-        "entry_point_string",
+        "entry_point_types",
+        /* with_unpublished_deps */ false,
     )
     .await;
 
     // pass a valid ascii string
     let ascii_str = "SomeString";
-    let ascii_str_bcs = MoveValue::Struct(MoveStruct::Runtime(vec![MoveValue::Vector(
-        ascii_str
-            .as_bytes()
-            .iter()
-            .map(|c| MoveValue::U8(*c))
-            .collect(),
-    )]))
-    .simple_serialize()
-    .unwrap();
-
+    let ascii_str_bcs = bcs::to_bytes(ascii_str).unwrap();
+    let n = ascii_str.len() as u64;
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
-        "entry_point_string",
+        &package.0,
+        "entry_point_types",
         "ascii_arg",
         vec![],
-        vec![TestCallArg::Pure(ascii_str_bcs)],
+        vec![
+            TestCallArg::Pure(ascii_str_bcs),
+            TestCallArg::Pure(bcs::to_bytes(&n).unwrap()),
+        ],
     )
     .await
     .unwrap();
-    assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
-        "{:?}",
-        effects.status
-    );
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
 
     // pass a valid utf8 string
     let utf8_str = "çå∞≠¢õß∂ƒ∫";
-    let utf_str_bcs = MoveValue::Struct(MoveStruct::Runtime(vec![MoveValue::Vector(
-        utf8_str
-            .as_bytes()
-            .iter()
-            .map(|c| MoveValue::U8(*c))
-            .collect(),
-    )]))
-    .simple_serialize()
-    .unwrap();
-
+    let utf_str_bcs = bcs::to_bytes(utf8_str).unwrap();
+    let n = utf8_str.len() as u64;
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
-        "entry_point_string",
+        &package.0,
+        "entry_point_types",
         "utf8_arg",
+        vec![],
+        vec![
+            TestCallArg::Pure(utf_str_bcs),
+            TestCallArg::Pure(bcs::to_bytes(&n).unwrap()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
+
+    // pass a valid longer utf8 string
+    let utf8_str = "çå∞≠¢õß∂ƒ∫çå∞≠¢õß∂ƒ∫çå∞≠¢õß∂ƒ∫çå∞≠¢õß∂ƒ∫çå∞≠¢õß∂ƒ∫çå∞≠¢õß∂ƒ∫";
+    let utf_str_bcs = bcs::to_bytes(utf8_str).unwrap();
+    let n = utf8_str.len() as u64;
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "entry_point_types",
+        "utf8_arg",
+        vec![],
+        vec![
+            TestCallArg::Pure(utf_str_bcs),
+            TestCallArg::Pure(bcs::to_bytes(&n).unwrap()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
+}
+
+#[tokio::test]
+#[cfg_attr(msim, ignore)]
+async fn test_nested_string() {
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+    let gas = ObjectID::random();
+    let authority = init_state_with_ids(vec![(sender, gas)]).await;
+
+    let package = build_and_publish_test_package(
+        &authority,
+        &sender,
+        &sender_key,
+        &gas,
+        "entry_point_types",
+        /* with_unpublished_deps */ false,
+    )
+    .await;
+
+    // pass an option utf8 string
+    let utf8_str = Some("çå∞≠¢õß∂ƒ∫");
+    let utf_str_bcs = bcs::to_bytes(&utf8_str).unwrap();
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "entry_point_types",
+        "option_utf8_arg",
         vec![],
         vec![TestCallArg::Pure(utf_str_bcs)],
     )
     .await
     .unwrap();
-    assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
-        "{:?}",
-        effects.status
-    );
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
+
+    // vector option utf8 string
+    let utf8_str = vec![Some("çå∞≠¢õß∂ƒ∫")];
+    let utf_str_bcs = bcs::to_bytes(&utf8_str).unwrap();
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "entry_point_types",
+        "vec_option_utf8_arg",
+        vec![],
+        vec![TestCallArg::Pure(utf_str_bcs)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
+
+    // vector option utf8 string
+    let utf8_str = Some(vec![Some("çå∞≠¢õß∂ƒ∫")]);
+    let utf_str_bcs = bcs::to_bytes(&utf8_str).unwrap();
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "entry_point_types",
+        "option_vec_option_utf8_arg",
+        vec![],
+        vec![TestCallArg::Pure(utf_str_bcs)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
+
+    // pass an empty option utf8 string
+    let utf8_str: Option<String> = None;
+    let utf_str_bcs = bcs::to_bytes(&utf8_str).unwrap();
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "entry_point_types",
+        "option_utf8_arg",
+        vec![],
+        vec![TestCallArg::Pure(utf_str_bcs)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
+
+    // an empty vector option utf8 string
+    let utf8_str: Vec<Option<String>> = vec![];
+    let utf_str_bcs = bcs::to_bytes(&utf8_str).unwrap();
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "entry_point_types",
+        "vec_option_utf8_arg",
+        vec![],
+        vec![TestCallArg::Pure(utf_str_bcs)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
+
+    // an vector of None
+    let utf8_str: Vec<Option<String>> = vec![None, None];
+    let utf_str_bcs = bcs::to_bytes(&utf8_str).unwrap();
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "entry_point_types",
+        "vec_option_utf8_arg",
+        vec![],
+        vec![TestCallArg::Pure(utf_str_bcs)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
+
+    // vector option utf8 string
+    let utf8_str: Option<Vec<Option<String>>> = Some(vec![None, None]);
+    let utf_str_bcs = bcs::to_bytes(&utf8_str).unwrap();
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "entry_point_types",
+        "option_vec_option_utf8_arg",
+        vec![],
+        vec![TestCallArg::Pure(utf_str_bcs)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
 }
 
 #[tokio::test]
+#[cfg_attr(msim, ignore)]
 async fn test_entry_point_string_vec() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas = ObjectID::random();
@@ -1574,53 +1958,37 @@ async fn test_entry_point_string_vec() {
         &sender,
         &sender_key,
         &gas,
-        "entry_point_string",
+        "entry_point_types",
+        /* with_unpublished_deps */ false,
     )
     .await;
 
     // pass a valid utf8 string vector
     let utf8_str_1 = "çå∞≠¢";
     let utf8_str_2 = "õß∂ƒ∫";
-    let utf_str_vec_bcs = MoveValue::Vector(vec![
-        MoveValue::Struct(MoveStruct::Runtime(vec![MoveValue::Vector(
-            utf8_str_1
-                .as_bytes()
-                .iter()
-                .map(|c| MoveValue::U8(*c))
-                .collect(),
-        )])),
-        MoveValue::Struct(MoveStruct::Runtime(vec![MoveValue::Vector(
-            utf8_str_2
-                .as_bytes()
-                .iter()
-                .map(|c| MoveValue::U8(*c))
-                .collect(),
-        )])),
-    ])
-    .simple_serialize()
-    .unwrap();
-
+    let utf_str_vec_bcs = bcs::to_bytes(&vec![utf8_str_1, utf8_str_2]).unwrap();
+    let total_len = (utf8_str_1.len() + utf8_str_2.len()) as u64;
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
-        "entry_point_string",
+        &package.0,
+        "entry_point_types",
         "utf8_vec_arg",
         vec![],
-        vec![TestCallArg::Pure(utf_str_vec_bcs)],
+        vec![
+            TestCallArg::Pure(utf_str_vec_bcs),
+            TestCallArg::Pure(bcs::to_bytes(&total_len).unwrap()),
+        ],
     )
     .await
     .unwrap();
-    assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
-        "{:?}",
-        effects.status
-    );
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
 }
 
 #[tokio::test]
+#[cfg_attr(msim, ignore)]
 async fn test_entry_point_string_error() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas = ObjectID::random();
@@ -1631,79 +1999,115 @@ async fn test_entry_point_string_error() {
         &sender,
         &sender_key,
         &gas,
-        "entry_point_string",
+        "entry_point_types",
+        /* with_unpublished_deps */ false,
     )
     .await;
 
-    // pass a invalid ascii string
-    let ascii_str = "SomeString";
-    let mut ascii_u8_vec: Vec<MoveValue> = ascii_str
-        .as_bytes()
-        .iter()
-        .map(|c| MoveValue::U8(*c))
-        .collect();
-    // mess up one element
-    ascii_u8_vec[7] = MoveValue::U8(255);
-
-    let ascii_str_bcs =
-        MoveValue::Struct(MoveStruct::Runtime(vec![MoveValue::Vector(ascii_u8_vec)]))
-            .simple_serialize()
-            .unwrap();
-
+    // pass a utf string for ascii
+    let utf8_str = "çå∞≠¢õß∂ƒ∫";
+    let utf_str_bcs = bcs::to_bytes(utf8_str).unwrap();
+    let n = utf8_str.len() as u64;
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
-        "entry_point_string",
+        &package.0,
+        "entry_point_types",
         "ascii_arg",
         vec![],
-        vec![TestCallArg::Pure(ascii_str_bcs)],
+        vec![
+            TestCallArg::Pure(utf_str_bcs),
+            TestCallArg::Pure(bcs::to_bytes(&n).unwrap()),
+        ],
     )
     .await
     .unwrap();
-    assert!(
-        matches!(effects.status, ExecutionStatus::Failure { .. }),
-        "{:?}",
-        effects.status
+    assert_eq!(
+        effects.status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionFailureStatus::CommandArgumentError {
+                arg_idx: 0,
+                kind: CommandArgumentError::InvalidBCSBytes
+            },
+            command: Some(0)
+        }
+    );
+
+    // pass a invalid ascii string
+    let ascii_str = "SomeString";
+    let n = ascii_str.len() as u64;
+    let mut ascii_u8_vec = ascii_str.as_bytes().to_vec();
+    // mess up one element
+    ascii_u8_vec[7] = 255;
+
+    let ascii_str_bcs = bcs::to_bytes(&ascii_u8_vec).unwrap();
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "entry_point_types",
+        "ascii_arg",
+        vec![],
+        vec![
+            TestCallArg::Pure(ascii_str_bcs),
+            TestCallArg::Pure(bcs::to_bytes(&n).unwrap()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        effects.status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionFailureStatus::CommandArgumentError {
+                arg_idx: 0,
+                kind: CommandArgumentError::InvalidBCSBytes
+            },
+            command: Some(0)
+        }
     );
 
     // pass a invalid utf8 string
     let utf8_str = "çå∞≠¢õß∂ƒ∫";
-    let mut utf8_u8_vec: Vec<MoveValue> = utf8_str
-        .as_bytes()
-        .iter()
-        .map(|c| MoveValue::U8(*c))
-        .collect();
+    let n = utf8_str.len() as u64;
+    let mut utf8_u8_vec = utf8_str.as_bytes().to_vec();
     // mess up one element
-    utf8_u8_vec[7] = MoveValue::U8(255);
+    utf8_u8_vec[7] = 255;
 
-    let utf8_str_bcs = MoveValue::Struct(MoveStruct::Runtime(vec![MoveValue::Vector(utf8_u8_vec)]))
-        .simple_serialize()
-        .unwrap();
-
+    let utf8_str_bcs = bcs::to_bytes(&utf8_u8_vec).unwrap();
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
-        "entry_point_string",
+        &package.0,
+        "entry_point_types",
         "utf8_arg",
         vec![],
-        vec![TestCallArg::Pure(utf8_str_bcs)],
+        vec![
+            TestCallArg::Pure(utf8_str_bcs),
+            TestCallArg::Pure(bcs::to_bytes(&n).unwrap()),
+        ],
     )
     .await
     .unwrap();
-    assert!(
-        matches!(effects.status, ExecutionStatus::Failure { .. }),
-        "{:?}",
-        effects.status
+    assert_eq!(
+        effects.status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionFailureStatus::CommandArgumentError {
+                arg_idx: 0,
+                kind: CommandArgumentError::InvalidBCSBytes
+            },
+            command: Some(0)
+        }
     );
 }
 
 #[tokio::test]
+#[cfg_attr(msim, ignore)]
 async fn test_entry_point_string_vec_error() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas = ObjectID::random();
@@ -1714,51 +2118,701 @@ async fn test_entry_point_string_vec_error() {
         &sender,
         &sender_key,
         &gas,
-        "entry_point_string",
+        "entry_point_types",
+        /* with_unpublished_deps */ false,
     )
     .await;
 
     // pass an utf8 string vector with one invalid string
     let utf8_str_1 = "çå∞≠¢";
     let utf8_str_2 = "õß∂ƒ∫";
-    let mut utf8_u8_vec_1: Vec<MoveValue> = utf8_str_1
-        .as_bytes()
-        .iter()
-        .map(|c| MoveValue::U8(*c))
-        .collect();
+    let total_len = (utf8_str_1.len() + utf8_str_2.len()) as u64;
+    let mut utf8_u8_vec_1 = utf8_str_1.as_bytes().to_vec();
     // mess up one element
-    utf8_u8_vec_1[7] = MoveValue::U8(255);
-    let utf_str_vec_bcs = MoveValue::Vector(vec![
-        MoveValue::Struct(MoveStruct::Runtime(vec![MoveValue::Vector(utf8_u8_vec_1)])),
-        MoveValue::Struct(MoveStruct::Runtime(vec![MoveValue::Vector(
-            utf8_str_2
-                .as_bytes()
-                .iter()
-                .map(|c| MoveValue::U8(*c))
-                .collect(),
-        )])),
-    ])
-    .simple_serialize()
-    .unwrap();
+    utf8_u8_vec_1[7] = 255;
+    let utf8_u8_vec_2 = utf8_str_2.as_bytes().to_vec();
+    let utf_str_vec_bcs = bcs::to_bytes(&[utf8_u8_vec_1, utf8_u8_vec_2]).unwrap();
 
     let effects = call_move(
         &authority,
         &gas,
         &sender,
         &sender_key,
-        &package,
-        "entry_point_string",
+        &package.0,
+        "entry_point_types",
         "utf8_vec_arg",
+        vec![],
+        vec![
+            TestCallArg::Pure(utf_str_vec_bcs),
+            TestCallArg::Pure(bcs::to_bytes(&total_len).unwrap()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        effects.status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionFailureStatus::CommandArgumentError {
+                arg_idx: 0,
+                kind: CommandArgumentError::InvalidBCSBytes
+            },
+            command: Some(0)
+        }
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(msim, ignore)]
+async fn test_entry_point_string_option_error() {
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+    let gas = ObjectID::random();
+    let authority = init_state_with_ids(vec![(sender, gas)]).await;
+
+    let package = build_and_publish_test_package(
+        &authority,
+        &sender,
+        &sender_key,
+        &gas,
+        "entry_point_types",
+        /* with_unpublished_deps */ false,
+    )
+    .await;
+
+    // pass an ascii string option with an invalid string
+    let utf8_str = "çå∞≠¢õß∂ƒ∫";
+    let utf_option_bcs = bcs::to_bytes(&Some(utf8_str)).unwrap();
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "entry_point_types",
+        "option_ascii_arg",
+        vec![],
+        vec![TestCallArg::Pure(utf_option_bcs)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        effects.status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionFailureStatus::CommandArgumentError {
+                arg_idx: 0,
+                kind: CommandArgumentError::InvalidBCSBytes
+            },
+            command: Some(0)
+        }
+    );
+
+    // pass an utf8 string option with an invalid string
+    let utf8_str = "çå∞≠¢";
+    let mut utf8_u8_vec = utf8_str.as_bytes().to_vec();
+    // mess up one element
+    utf8_u8_vec[7] = 255;
+    let utf_str_vec_bcs = bcs::to_bytes(&Some(utf8_u8_vec)).unwrap();
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "entry_point_types",
+        "option_utf8_arg",
         vec![],
         vec![TestCallArg::Pure(utf_str_vec_bcs)],
     )
     .await
     .unwrap();
-    assert!(
-        matches!(effects.status, ExecutionStatus::Failure { .. }),
-        "{:?}",
-        effects.status
+    assert_eq!(
+        effects.status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionFailureStatus::CommandArgumentError {
+                arg_idx: 0,
+                kind: CommandArgumentError::InvalidBCSBytes
+            },
+            command: Some(0)
+        }
     );
+
+    // pass a vector as an option
+    let utf8_str_1 = "çå∞≠¢";
+    let utf8_str_2 = "õß∂ƒ∫";
+    let utf_str_vec_bcs = bcs::to_bytes(&vec![utf8_str_1, utf8_str_2]).unwrap();
+    let effects = call_move(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        &package.0,
+        "entry_point_types",
+        "option_utf8_arg",
+        vec![],
+        vec![TestCallArg::Pure(utf_str_vec_bcs)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        effects.status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionFailureStatus::CommandArgumentError {
+                arg_idx: 0,
+                kind: CommandArgumentError::InvalidBCSBytes
+            },
+            command: Some(0)
+        }
+    );
+}
+
+async fn test_make_move_vec_for_type<T: Clone + Serialize>(
+    authority: &AuthorityState,
+    gas: &ObjectID,
+    sender: &SuiAddress,
+    sender_key: &AccountKeyPair,
+    package_id: ObjectID,
+    t: TypeTag,
+    value: T,
+) {
+    fn make_and_drop(
+        builder: &mut ProgrammableTransactionBuilder,
+        package: ObjectID,
+        t: &TypeTag,
+        args: Vec<Argument>,
+    ) {
+        let n = builder.pure(args.len() as u64).unwrap();
+        let vec = builder.command(Command::MakeMoveVec(Some(t.clone().into()), args));
+        builder.programmable_move_call(
+            package,
+            Identifier::new("entry_point_types").unwrap(),
+            Identifier::new("drop_all").unwrap(),
+            vec![t.clone()],
+            vec![vec, n],
+        );
+    }
+    let rgp = authority.reference_gas_price_for_testing().unwrap();
+    // empty
+    let mut builder = ProgrammableTransactionBuilder::new();
+    make_and_drop(&mut builder, package_id, &t, vec![]);
+    let pt = builder.finish();
+    let effects = execute_programmable_transaction(
+        authority,
+        gas,
+        sender,
+        sender_key,
+        pt,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+    )
+    .await
+    .unwrap();
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
+    assert!(effects.created().is_empty());
+    assert_eq!(effects.mutated().len(), 1);
+    assert!(effects.unwrapped().is_empty());
+    assert!(effects.deleted().is_empty());
+    assert!(effects.unwrapped_then_deleted().is_empty());
+
+    // single
+    let mut builder = ProgrammableTransactionBuilder::new();
+    let args = vec![builder.pure(value.clone()).unwrap()];
+    make_and_drop(&mut builder, package_id, &t, args);
+    let pt = builder.finish();
+    let effects = execute_programmable_transaction(
+        authority,
+        gas,
+        sender,
+        sender_key,
+        pt,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+    )
+    .await
+    .unwrap();
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
+    assert!(effects.created().is_empty());
+    assert_eq!(effects.mutated().len(), 1);
+    assert!(effects.unwrapped().is_empty());
+    assert!(effects.deleted().is_empty());
+    assert!(effects.unwrapped_then_deleted().is_empty());
+
+    // two
+    let mut builder = ProgrammableTransactionBuilder::new();
+    let args = vec![
+        builder.pure(value.clone()).unwrap(),
+        builder.pure(value.clone()).unwrap(),
+    ];
+    make_and_drop(&mut builder, package_id, &t, args);
+    let pt = builder.finish();
+    let effects = execute_programmable_transaction(
+        authority,
+        gas,
+        sender,
+        sender_key,
+        pt,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+    )
+    .await
+    .unwrap();
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
+    assert!(effects.created().is_empty());
+    assert_eq!(effects.mutated().len(), 1);
+    assert!(effects.unwrapped().is_empty());
+    assert!(effects.deleted().is_empty());
+    assert!(effects.unwrapped_then_deleted().is_empty());
+
+    // with move call value
+    let mut builder = ProgrammableTransactionBuilder::new();
+    let arg = builder.pure(value.clone()).unwrap();
+    let id_result = builder.programmable_move_call(
+        package_id,
+        Identifier::new("entry_point_types").unwrap(),
+        Identifier::new("id").unwrap(),
+        vec![t.clone()],
+        vec![arg],
+    );
+    let args = vec![arg, id_result, arg];
+    make_and_drop(&mut builder, package_id, &t, args);
+    let pt = builder.finish();
+    let effects = execute_programmable_transaction(
+        authority,
+        gas,
+        sender,
+        sender_key,
+        pt,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+    )
+    .await
+    .unwrap();
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
+    assert!(effects.created().is_empty());
+    assert_eq!(effects.mutated().len(), 1);
+    assert!(effects.unwrapped().is_empty());
+    assert!(effects.deleted().is_empty());
+    assert!(effects.unwrapped_then_deleted().is_empty());
+
+    // nested
+    let mut builder = ProgrammableTransactionBuilder::new();
+    let arg = builder.pure(value).unwrap();
+    let id_result = builder.programmable_move_call(
+        package_id,
+        Identifier::new("entry_point_types").unwrap(),
+        Identifier::new("id").unwrap(),
+        vec![t.clone()],
+        vec![arg],
+    );
+    let inner_args = vec![arg, id_result, arg];
+    let vec = builder.command(Command::MakeMoveVec(Some(t.clone().into()), inner_args));
+    let args = vec![vec, vec, vec];
+    make_and_drop(
+        &mut builder,
+        package_id,
+        &TypeTag::Vector(Box::new(t)),
+        args,
+    );
+    let pt = builder.finish();
+    let effects = execute_programmable_transaction(
+        authority,
+        gas,
+        sender,
+        sender_key,
+        pt,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+    )
+    .await
+    .unwrap();
+    assert_eq!(effects.status(), &ExecutionStatus::Success);
+    assert!(effects.created().is_empty());
+    assert_eq!(effects.mutated().len(), 1);
+    assert!(effects.unwrapped().is_empty());
+    assert!(effects.deleted().is_empty());
+    assert!(effects.unwrapped_then_deleted().is_empty());
+}
+
+macro_rules! make_vec_tests_for_type {
+    ($test:ident, $t:ty, $tag:expr, $value:expr) => {
+        #[tokio::test]
+        #[cfg_attr(msim, ignore)]
+        async fn $test() {
+            let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+            let gas = ObjectID::random();
+            let authority = init_state_with_ids(vec![(sender, gas)]).await;
+            let package = build_and_publish_test_package(
+                &authority,
+                &sender,
+                &sender_key,
+                &gas,
+                "entry_point_types",
+                /* with_unpublished_deps */ false,
+            )
+            .await;
+            let package_id = package.0;
+            test_make_move_vec_for_type(
+                &authority,
+                &gas,
+                &sender,
+                &sender_key,
+                package_id,
+                $tag,
+                $value,
+            )
+            .await;
+            test_make_move_vec_for_type(
+                &authority,
+                &gas,
+                &sender,
+                &sender_key,
+                package_id,
+                TypeTag::Vector(Box::new($tag)),
+                Vec::<$t>::new(),
+            )
+            .await;
+            test_make_move_vec_for_type(
+                &authority,
+                &gas,
+                &sender,
+                &sender_key,
+                package_id,
+                TypeTag::Vector(Box::new($tag)),
+                vec![$value, $value],
+            )
+            .await;
+            test_make_move_vec_for_type(
+                &authority,
+                &gas,
+                &sender,
+                &sender_key,
+                package_id,
+                option_tag($tag),
+                None::<$t>,
+            )
+            .await;
+            test_make_move_vec_for_type(
+                &authority,
+                &gas,
+                &sender,
+                &sender_key,
+                package_id,
+                option_tag($tag),
+                Some($value),
+            )
+            .await;
+            test_make_move_vec_for_type(
+                &authority,
+                &gas,
+                &sender,
+                &sender_key,
+                package_id,
+                TypeTag::Vector(Box::new(option_tag($tag))),
+                vec![None, Some($value)],
+            )
+            .await;
+        }
+    };
+}
+
+make_vec_tests_for_type!(test_make_move_vec_bool, bool, TypeTag::Bool, false);
+make_vec_tests_for_type!(test_make_move_vec_u8, u8, TypeTag::U8, 0u8);
+make_vec_tests_for_type!(test_make_move_vec_u16, u16, TypeTag::U16, 0u16);
+make_vec_tests_for_type!(test_make_move_vec_u32, u32, TypeTag::U32, 0u32);
+make_vec_tests_for_type!(test_make_move_vec_u64, u64, TypeTag::U64, 0u64);
+make_vec_tests_for_type!(test_make_move_vec_u128, u128, TypeTag::U128, 0u128);
+make_vec_tests_for_type!(test_make_move_vec_u256, U256, TypeTag::U256, U256::zero());
+make_vec_tests_for_type!(
+    test_make_move_vec_address,
+    SuiAddress,
+    TypeTag::Address,
+    SuiAddress::ZERO
+);
+make_vec_tests_for_type!(
+    test_make_move_vec_address_id,
+    ObjectID,
+    TypeTag::Struct(Box::new(sui_types::id::ID::type_())),
+    ObjectID::ZERO
+);
+make_vec_tests_for_type!(test_make_move_vec_utf8, &str, utf8_tag(), "❤️🧀");
+make_vec_tests_for_type!(
+    test_make_move_vec_ascii,
+    &str,
+    ascii_tag(),
+    "love and cheese"
+);
+
+async fn error_test_make_move_vec_for_type<T: Clone + Serialize>(
+    authority: &AuthorityState,
+    gas: &ObjectID,
+    sender: &SuiAddress,
+    sender_key: &AccountKeyPair,
+    t: TypeTag,
+    value: T,
+) {
+    let rgp = authority.reference_gas_price_for_testing().unwrap();
+
+    // single without a type argument
+    let mut builder = ProgrammableTransactionBuilder::new();
+    let arg = builder.pure(value.clone()).unwrap();
+    builder.command(Command::MakeMoveVec(None, vec![arg]));
+    let pt = builder.finish();
+    let effects = execute_programmable_transaction(
+        authority,
+        gas,
+        sender,
+        sender_key,
+        pt,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        effects.status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionFailureStatus::command_argument_error(
+                CommandArgumentError::TypeMismatch,
+                0
+            ),
+            command: Some(0)
+        }
+    );
+
+    // invalid BCS for any Move value
+    const ALWAYS_INVALID_BYTES: &[u8] = &[255, 255, 255];
+
+    // invalid bcs
+    let mut builder = ProgrammableTransactionBuilder::new();
+    let args = vec![builder.pure_bytes(ALWAYS_INVALID_BYTES.to_vec(), false)];
+    builder.command(Command::MakeMoveVec(Some(t.clone().into()), args));
+    let pt = builder.finish();
+    let effects = execute_programmable_transaction(
+        authority,
+        gas,
+        sender,
+        sender_key,
+        pt,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        effects.status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionFailureStatus::command_argument_error(
+                CommandArgumentError::InvalidBCSBytes,
+                0
+            ),
+            command: Some(0)
+        }
+    );
+
+    // invalid bcs bytes at end
+    let mut builder = ProgrammableTransactionBuilder::new();
+    let args = vec![
+        builder.pure(value.clone()).unwrap(),
+        builder.pure(value.clone()).unwrap(),
+        builder.pure(value).unwrap(),
+        builder.pure_bytes(ALWAYS_INVALID_BYTES.to_vec(), false),
+    ];
+    builder.command(Command::MakeMoveVec(Some(t.clone().into()), args));
+    let pt = builder.finish();
+    let effects = execute_programmable_transaction(
+        authority,
+        gas,
+        sender,
+        sender_key,
+        pt,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        effects.status(),
+        &ExecutionStatus::Failure {
+            error: ExecutionFailureStatus::command_argument_error(
+                CommandArgumentError::InvalidBCSBytes,
+                3,
+            ),
+            command: Some(0)
+        }
+    );
+}
+
+macro_rules! make_vec_error_tests_for_type {
+    ($test:ident, $t:ty, $tag:expr, $value:expr) => {
+        #[tokio::test]
+        #[cfg_attr(msim, ignore)]
+        async fn $test() {
+            let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+            let gas = ObjectID::random();
+            let authority = init_state_with_ids(vec![(sender, gas)]).await;
+            error_test_make_move_vec_for_type(&authority, &gas, &sender, &sender_key, $tag, $value)
+                .await;
+            error_test_make_move_vec_for_type(
+                &authority,
+                &gas,
+                &sender,
+                &sender_key,
+                TypeTag::Vector(Box::new($tag)),
+                Vec::<$t>::new(),
+            )
+            .await;
+            error_test_make_move_vec_for_type(
+                &authority,
+                &gas,
+                &sender,
+                &sender_key,
+                TypeTag::Vector(Box::new($tag)),
+                vec![$value, $value],
+            )
+            .await;
+            error_test_make_move_vec_for_type(
+                &authority,
+                &gas,
+                &sender,
+                &sender_key,
+                option_tag($tag),
+                None::<$t>,
+            )
+            .await;
+            error_test_make_move_vec_for_type(
+                &authority,
+                &gas,
+                &sender,
+                &sender_key,
+                option_tag($tag),
+                Some($value),
+            )
+            .await;
+            error_test_make_move_vec_for_type(
+                &authority,
+                &gas,
+                &sender,
+                &sender_key,
+                TypeTag::Vector(Box::new(option_tag($tag))),
+                vec![None, Some($value)],
+            )
+            .await;
+        }
+    };
+}
+
+make_vec_error_tests_for_type!(test_error_make_move_vec_bool, bool, TypeTag::Bool, false);
+make_vec_error_tests_for_type!(test_error_make_move_vec_u8, u8, TypeTag::U8, 0u8);
+make_vec_error_tests_for_type!(test_error_make_move_vec_u16, u16, TypeTag::U16, 0u16);
+make_vec_error_tests_for_type!(test_error_make_move_vec_u32, u32, TypeTag::U32, 0u32);
+make_vec_error_tests_for_type!(test_error_make_move_vec_u64, u64, TypeTag::U64, 0u64);
+make_vec_error_tests_for_type!(test_error_make_move_vec_u128, u128, TypeTag::U128, 0u128);
+make_vec_error_tests_for_type!(
+    test_error_make_move_vec_u256,
+    U256,
+    TypeTag::U256,
+    U256::zero()
+);
+make_vec_error_tests_for_type!(
+    test_error_make_move_vec_address,
+    SuiAddress,
+    TypeTag::Address,
+    SuiAddress::ZERO
+);
+make_vec_error_tests_for_type!(
+    test_error_make_move_vec_address_id,
+    ObjectID,
+    TypeTag::Struct(Box::new(sui_types::id::ID::type_())),
+    ObjectID::ZERO
+);
+make_vec_error_tests_for_type!(test_error_make_move_vec_utf8, &str, utf8_tag(), "❤️🧀");
+make_vec_error_tests_for_type!(
+    test_error_make_move_vec_ascii,
+    &str,
+    ascii_tag(),
+    "love and cheese"
+);
+
+#[tokio::test]
+#[cfg_attr(msim, ignore)]
+async fn test_make_move_vec_empty() {
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+    let gas = ObjectID::random();
+    let authority = init_state_with_ids(vec![(sender, gas)]).await;
+    let rgp = authority.reference_gas_price_for_testing().unwrap();
+    let mut builder = ProgrammableTransactionBuilder::new();
+    builder.command(Command::MakeMoveVec(None, vec![]));
+    let pt = builder.finish();
+    let result = execute_programmable_transaction(
+        &authority,
+        &gas,
+        &sender,
+        &sender_key,
+        pt,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        result,
+        SuiError::UserInputError {
+            error: UserInputError::EmptyCommandInput
+        }
+    );
+}
+
+fn resolved_struct(
+    (address, module, name): (&AccountAddress, &IdentStr, &IdentStr),
+    type_args: Vec<TypeTag>,
+) -> TypeTag {
+    TypeTag::Struct(Box::new(StructTag {
+        address: *address,
+        module: module.to_owned(),
+        name: name.to_owned(),
+        type_params: type_args,
+    }))
+}
+
+fn option_tag(inner: TypeTag) -> TypeTag {
+    resolved_struct(RESOLVED_STD_OPTION, vec![inner])
+}
+
+fn utf8_tag() -> TypeTag {
+    resolved_struct(RESOLVED_UTF8_STR, vec![])
+}
+
+fn ascii_tag() -> TypeTag {
+    resolved_struct(RESOLVED_ASCII_STR, vec![])
+}
+
+#[tokio::test]
+#[cfg_attr(msim, ignore)]
+async fn test_object_no_id_error() {
+    let mut build_config = BuildConfig::new_for_testing();
+    build_config.config.test_mode = true;
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // in this package object struct (NotObject) is defined incorrectly and publishing should
+    // fail (it's defined in test-only code hence cannot be checked by transactional testing
+    // framework which goes through "normal" publishing path which excludes tests).
+    path.extend(["src", "unit_tests", "data", "object_no_id"]);
+    let res = build_config.build(&path);
+
+    matches!(res.err(), Some(SuiError::ExecutionError(err_str)) if
+                 err_str.contains("SuiMoveVerificationError")
+                 && err_str.contains("First field of struct NotObject must be 'id'"));
+}
+
+pub fn build_test_package(test_dir: &str, with_unpublished_deps: bool) -> Vec<Vec<u8>> {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.extend(["src", "unit_tests", "data", test_dir]);
+    BuildConfig::new_for_testing()
+        .build(&path)
+        .unwrap()
+        .get_package_bytes(with_unpublished_deps)
+}
+
+pub fn build_package(
+    code_dir: &str,
+    with_unpublished_deps: bool,
+) -> (Vec<u8>, Vec<Vec<u8>>, Vec<ObjectID>) {
+    move_package::package_hooks::register_package_hooks(Box::new(SuiPackageHooks));
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.extend(["src", "unit_tests", "data", code_dir]);
+    let compiled_package = BuildConfig::new_for_testing().build(&path).unwrap();
+    let digest = compiled_package.get_package_digest(with_unpublished_deps);
+    let modules = compiled_package.get_package_bytes(with_unpublished_deps);
+    let dependencies = compiled_package.get_dependency_storage_package_ids();
+    (digest.to_vec(), modules, dependencies)
 }
 
 pub async fn build_and_try_publish_test_package(
@@ -1768,67 +2822,224 @@ pub async fn build_and_try_publish_test_package(
     gas_object_id: &ObjectID,
     test_dir: &str,
     gas_budget: u64,
-) -> TransactionInfoResponse {
-    let build_config = BuildConfig::default();
+    gas_price: u64,
+    with_unpublished_deps: bool,
+) -> (Transaction, SignedTransactionEffects) {
+    move_package::package_hooks::register_package_hooks(Box::new(SuiPackageHooks));
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("src/unit_tests/data/");
-    path.push(test_dir);
-    let modules = sui_framework::build_move_package(&path, build_config).unwrap();
+    path.extend(["src", "unit_tests", "data", test_dir]);
 
-    let all_module_bytes = modules
-        .iter()
-        .map(|m| {
-            let mut module_bytes = Vec::new();
-            m.serialize(&mut module_bytes).unwrap();
-            module_bytes
-        })
-        .collect();
+    let compiled_package = BuildConfig::new_for_testing().build(&path).unwrap();
+    let all_module_bytes = compiled_package.get_package_bytes(with_unpublished_deps);
+    let dependencies = compiled_package.get_dependency_storage_package_ids();
 
-    let gas_object = authority.get_object(gas_object_id).await.unwrap();
+    let gas_object = authority.get_object(gas_object_id).await;
     let gas_object_ref = gas_object.unwrap().compute_object_reference();
 
-    let data = TransactionData::new_module(*sender, gas_object_ref, all_module_bytes, gas_budget);
+    let data = TransactionData::new_module(
+        *sender,
+        gas_object_ref,
+        all_module_bytes,
+        dependencies,
+        gas_budget,
+        gas_price,
+    );
     let transaction = to_sender_signed_transaction(data, sender_key);
 
-    send_and_confirm_transaction(authority, transaction)
-        .await
-        .unwrap()
+    (
+        transaction.clone(),
+        send_and_confirm_transaction(authority, transaction)
+            .await
+            .unwrap()
+            .1,
+    )
 }
 
-async fn build_and_publish_test_package(
+pub async fn build_and_publish_test_package(
     authority: &AuthorityState,
     sender: &SuiAddress,
     sender_key: &AccountKeyPair,
     gas_object_id: &ObjectID,
     test_dir: &str,
+    with_unpublished_deps: bool,
 ) -> ObjectRef {
+    build_and_publish_test_package_with_upgrade_cap(
+        authority,
+        sender,
+        sender_key,
+        gas_object_id,
+        test_dir,
+        with_unpublished_deps,
+    )
+    .await
+    .0
+}
+
+pub async fn build_and_publish_test_package_with_upgrade_cap(
+    authority: &AuthorityState,
+    sender: &SuiAddress,
+    sender_key: &AccountKeyPair,
+    gas_object_id: &ObjectID,
+    test_dir: &str,
+    with_unpublished_deps: bool,
+) -> (ObjectRef, ObjectRef) {
+    let gas_price = authority.reference_gas_price_for_testing().unwrap();
+    let gas_budget = TEST_ONLY_GAS_UNIT_FOR_PUBLISH * gas_price;
     let effects = build_and_try_publish_test_package(
         authority,
         sender,
         sender_key,
         gas_object_id,
         test_dir,
-        MAX_GAS,
+        gas_budget,
+        gas_price,
+        with_unpublished_deps,
     )
     .await
-    .signed_effects
-    .unwrap()
-    .effects;
+    .1
+    .into_data();
     assert!(
-        matches!(effects.status, ExecutionStatus::Success { .. }),
+        matches!(effects.status(), ExecutionStatus::Success { .. }),
         "{:?}",
-        effects.status
+        effects.status()
     );
-    effects.created[0].0
+
+    let package = effects
+        .created()
+        .into_iter()
+        .find(|(_, owner)| matches!(owner, Owner::Immutable))
+        .unwrap();
+    let upgrade_cap = effects
+        .created()
+        .into_iter()
+        .find(|(_, owner)| matches!(owner, Owner::AddressOwner(_)))
+        .unwrap();
+
+    (package.0, upgrade_cap.0)
 }
 
-async fn check_latest_object_ref(authority: &AuthorityState, object_ref: &ObjectRef) {
+pub async fn collect_packages_and_upgrade_caps(
+    authority: &AuthorityState,
+    effects: &TransactionEffects,
+) -> HashMap<ObjectID, ObjectRef> {
+    let packages: HashMap<_, _> = effects
+        .created()
+        .into_iter()
+        .filter(|(_, owner)| matches!(owner, Owner::Immutable))
+        .map(|(package, _)| (package.0, package))
+        .collect();
+    let mut caps = HashMap::new();
+    for (obj_ref, owner) in effects.created() {
+        if !matches!(owner, Owner::AddressOwner(_)) {
+            continue;
+        }
+        let cap = authority.get_object(&obj_ref.0).await.unwrap();
+        let bcs = cap.data.try_as_move().unwrap().contents();
+        let obj: UpgradeCap = bcs::from_bytes(bcs).unwrap();
+        let pkg = packages.get(&obj.package.bytes).unwrap();
+        caps.insert(pkg.0, obj_ref);
+    }
+    caps
+}
+
+pub async fn run_multi_txns(
+    authority: &AuthorityState,
+    sender: SuiAddress,
+    sender_key: &AccountKeyPair,
+    gas_object_id: &ObjectID,
+    builder: ProgrammableTransactionBuilder,
+) -> Result<(CertifiedTransaction, SignedTransactionEffects), SuiError> {
+    // build the transaction data
+    let pt = builder.finish();
+    let gas_object = authority.get_object(gas_object_id).await;
+    let gas_object_ref = gas_object.unwrap().compute_object_reference();
+    let gas_price = authority.reference_gas_price_for_testing().unwrap();
+    let gas_budget = pt.non_system_packages_to_be_published().count() as u64
+        * TEST_ONLY_GAS_UNIT_FOR_PUBLISH
+        * gas_price;
+    let data =
+        TransactionData::new_programmable(sender, vec![gas_object_ref], pt, gas_budget, gas_price);
+    // run the transaction
+    let transaction = to_sender_signed_transaction(data, sender_key);
+    send_and_confirm_transaction(authority, transaction).await
+}
+
+pub fn build_multi_publish_txns(
+    builder: &mut ProgrammableTransactionBuilder,
+    sender: SuiAddress,
+    packages: Vec<(Vec<Vec<u8>>, Vec<ObjectID>)>,
+) {
+    for (modules, dep_ids) in packages {
+        let upgrade_cap = builder.publish_upgradeable(modules, dep_ids);
+        builder.transfer_arg(sender, upgrade_cap);
+    }
+}
+
+pub struct UpgradeData {
+    pub package_id: ObjectID,
+    pub upgrade_cap: ObjectRef,
+    pub policy: u8,
+    pub digest: Vec<u8>,
+    pub dep_ids: Vec<ObjectID>,
+    pub modules: Vec<Vec<u8>>,
+}
+
+pub fn build_multi_upgrade_txns(
+    builder: &mut ProgrammableTransactionBuilder,
+    package_upgrades: Vec<UpgradeData>,
+) {
+    // build the programmable transaction
+    for package_upgrade in package_upgrades {
+        let package_id = package_upgrade.package_id;
+        let cap = builder
+            .obj(ObjectArg::ImmOrOwnedObject(package_upgrade.upgrade_cap))
+            .unwrap();
+        let policy = builder.pure(package_upgrade.policy).unwrap();
+        let digest = builder.pure(package_upgrade.digest).unwrap();
+        let ticket = builder.programmable_move_call(
+            SUI_FRAMEWORK_PACKAGE_ID,
+            Identifier::new("package").unwrap(),
+            Identifier::new("authorize_upgrade").unwrap(),
+            vec![],
+            vec![cap, policy, digest],
+        );
+        let receipt = builder.upgrade(
+            package_id,
+            ticket,
+            package_upgrade.dep_ids,
+            package_upgrade.modules,
+        );
+        builder.programmable_move_call(
+            SUI_FRAMEWORK_PACKAGE_ID,
+            Identifier::new("package").unwrap(),
+            Identifier::new("commit_upgrade").unwrap(),
+            vec![],
+            vec![cap, receipt],
+        );
+    }
+}
+
+async fn check_latest_object_ref(
+    authority: &AuthorityState,
+    object_ref: &ObjectRef,
+    expect_not_found: bool,
+) {
     let response = authority
         .handle_object_info_request(ObjectInfoRequest {
             object_id: object_ref.0,
-            request_kind: ObjectInfoRequestKind::LatestObjectInfo(None),
+            generate_layout: LayoutGenerationOption::None,
+            request_kind: ObjectInfoRequestKind::LatestObjectInfo,
         })
-        .await
-        .unwrap();
-    assert_eq!(&response.requested_object_reference.unwrap(), object_ref,);
+        .await;
+    if expect_not_found {
+        assert!(matches!(
+            UserInputError::try_from(response.unwrap_err()).unwrap(),
+            UserInputError::ObjectNotFound { .. },
+        ));
+    } else {
+        assert_eq!(
+            &response.unwrap().object.compute_object_reference(),
+            object_ref
+        );
+    }
 }
